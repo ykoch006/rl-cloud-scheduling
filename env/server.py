@@ -46,9 +46,8 @@ class Server:
                 f"needs cpu={job.cpu_required}, memory={job.memory_required}; "
                 f"available cpu={self.available_cpu}, memory={self.available_memory}"
             )
-        self.available_cpu -= job.cpu_required
-        self.available_memory -= job.memory_required
         self.running_jobs.append(job)
+        self._update_available()
 
     def release(self, job: Job) -> None:
         """Free the resources held by `job`.
@@ -58,8 +57,16 @@ class Server:
         if job not in self.running_jobs:
             raise ValueError(f"Job {job.id} is not running on server {self.id}")
         self.running_jobs.remove(job)
-        self.available_cpu += job.cpu_required
-        self.available_memory += job.memory_required
+        self._update_available()
+
+    def _update_available(self) -> None:
+        # Recomputed from the running jobs rather than adding and subtracting
+        # each time, so floating-point rounding cannot build up over thousands
+        # of placements and an empty server reports exactly its full capacity.
+        self.available_cpu = self.cpu_capacity - sum(j.cpu_required for j in self.running_jobs)
+        self.available_memory = self.memory_capacity - sum(
+            j.memory_required for j in self.running_jobs
+        )
 
     def cpu_utilisation(self) -> float:
         """Fraction of CPU capacity currently reserved, between 0 and 1."""
