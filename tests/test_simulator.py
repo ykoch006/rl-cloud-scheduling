@@ -1,11 +1,12 @@
 import pytest
 
+from env.candidates import CandidateRule
 from env.cluster import Cluster
 from env.job import Job, JobStatus
 from env.server import Server
 from env.simulator import Simulator
 from env.workload import build_deterministic_workload
-from schedulers.first_fit import FirstFitScheduler
+from schedulers.fcfs import FCFSScheduler
 
 
 def make_cluster(server_count: int = 3) -> Cluster:
@@ -19,14 +20,14 @@ def make_cluster(server_count: int = 3) -> Cluster:
 
 def run_demo():
     jobs = build_deterministic_workload()
-    simulator = Simulator(make_cluster(), FirstFitScheduler(), jobs)
+    simulator = Simulator(make_cluster(), FCFSScheduler(), jobs)
     metrics = simulator.run()
     return simulator, metrics, {job.id: job for job in jobs}
 
 
 def test_single_job_runs_for_exactly_its_duration():
     job = Job(id=1, arrival_time=2, duration=3, cpu_required=10.0, memory_required=4.0)
-    simulator = Simulator(make_cluster(1), FirstFitScheduler(), [job])
+    simulator = Simulator(make_cluster(1), FCFSScheduler(), [job])
 
     metrics = simulator.run()
 
@@ -40,7 +41,7 @@ def test_single_job_runs_for_exactly_its_duration():
 def test_job_waits_in_queue_until_resources_are_released():
     first = Job(id=1, arrival_time=0, duration=3, cpu_required=80.0, memory_required=4.0)
     second = Job(id=2, arrival_time=1, duration=2, cpu_required=50.0, memory_required=4.0)
-    simulator = Simulator(make_cluster(1), FirstFitScheduler(), [first, second])
+    simulator = Simulator(make_cluster(1), FCFSScheduler(), [first, second])
 
     metrics = simulator.run()
 
@@ -108,7 +109,7 @@ def test_utilisation_never_exceeds_capacity():
 
 def test_job_too_large_for_any_server_stops_at_max_timesteps():
     huge = Job(id=1, arrival_time=0, duration=1, cpu_required=500.0, memory_required=4.0)
-    simulator = Simulator(make_cluster(), FirstFitScheduler(), [huge])
+    simulator = Simulator(make_cluster(), FCFSScheduler(), [huge])
 
     metrics = simulator.run(max_timesteps=20)
 
@@ -123,8 +124,10 @@ class OverloadingScheduler:
 
     name = "overloading"
 
-    def schedule(self, queued_jobs, servers):
-        return [(job, servers[0]) for job in queued_jobs]
+    candidate_rule = CandidateRule.FEASIBLE
+
+    def choose(self, candidates, servers):
+        return candidates[0], servers[0]
 
 
 def test_simulator_rejects_invalid_placements_from_any_scheduler():

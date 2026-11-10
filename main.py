@@ -1,10 +1,35 @@
-"""Run the deterministic workload through a 3-server cluster and print the results."""
+"""Command-line entry point.
+
+    python main.py
+        Run the fixed 10-job workload through a 3-server cluster.
+
+    python main.py --workload medium --seed 42 --timesteps 1000
+        Generate a stochastic workload and summarise it. This only generates
+        the workload; it does not simulate it.
+
+    python main.py --workload medium --seed 1 2 --timesteps 200
+        Generate the same profile with two seeds and compare them side by side.
+"""
+
+import argparse
+from statistics import fmean
 
 from env.cluster import Cluster
 from env.server import Server
 from env.simulator import SimulationMetrics, Simulator
-from env.workload import build_deterministic_workload
-from schedulers.first_fit import FirstFitScheduler
+from env.workload import build_deterministic_workload, validate_workload
+from env.workload_generator import (
+    PROFILES,
+    REFERENCE_SERVER_COUNT,
+    REFERENCE_SERVER_CPU,
+    REFERENCE_SERVER_MEMORY,
+    WorkloadConfig,
+    expected_offered_load,
+    generate_workload,
+    observed_offered_load,
+    profile_config,
+)
+from schedulers.fcfs import FCFSScheduler
 
 
 def build_cluster() -> Cluster:
@@ -32,9 +57,9 @@ def print_summary(metrics: SimulationMetrics, total_jobs: int, scheduler_name: s
         print(f"  Server {server_id}: CPU {cpu:.1%}, memory {memory:.1%}")
 
 
-def main() -> None:
+def run_deterministic_demo() -> None:
     jobs = build_deterministic_workload()
-    scheduler = FirstFitScheduler()
+    scheduler = FCFSScheduler()
     simulator = Simulator(build_cluster(), scheduler, jobs)
 
     metrics = simulator.run()
@@ -42,6 +67,139 @@ def main() -> None:
     for time, message in simulator.events:
         print(f"t={time} {message}")
     print_summary(metrics, len(jobs), scheduler.name)
+
+
+def describe_arrivals(config: WorkloadConfig) -> str:
+    if config.burst is None:
+        return f"arrival rate {config.arrival_rate} jobs/timestep"
+    burst = config.burst
+    last = burst.burst_start + burst.burst_length - 1
+    return (f"arrival rate {config.arrival_rate} jobs/timestep, rising to {burst.burst_rate} "
+            f"in ticks {burst.burst_start}-{last} of every {burst.period}")
+
+
+def print_workload_summary(profile: str, seed: int, horizon: int) -> None:
+    """Generate a workload and print observed statistics next to theoretical ones."""
+    config = profile_config(profile, seed, horizon)
+    specs = generate_workload(config)
+
+    print(f"Workload profile: {profile} ({describe_arrivals(config)})")
+    print(f"Seed: {seed}")
+    print(f"Arrival horizon: {horizon} timesteps")
+    print(f"Jobs generated: {len(specs)}")
+    print()
+    print("Observed in this workload:")
+    if specs:
+        print(f"  Mean CPU demand: {fmean(s.cpu_required for s in specs):.2f} units")
+        print(f"  Mean RAM demand: {fmean(s.memory_required for s in specs):.2f} GB")
+        print(f"  Mean duration:   {fmean(s.duration for s in specs):.2f} timesteps")
+    else:
+        print("  (no jobs generated)")
+    print("Expected from the configuration:")
+    print(f"  Jobs:            {config.arrival_rates().sum():.0f}")
+    print(f"  Mean CPU demand: {config.cpu.expected_value():.2f} units")
+    print(f"  Mean RAM demand: {config.memory.expected_value():.2f} GB")
+    print(f"  Mean duration:   {config.duration.expected_value():.2f} timesteps")
+    print()
+    print("First 10 arrivals (id, arrival time, duration, CPU, RAM GB):")
+    for s in specs[:10]:
+        print(
+            f"  {s.id:>3}  t={s.arrival_time:<4} dur={s.duration:<3} "
+            f"cpu={s.cpu_required:6.2f}  ram={s.memory_required:5.2f}"
+        )
+    print()
+    print(
+        f"Offered load on {REFERENCE_SERVER_COUNT} reference servers "
+        f"({REFERENCE_SERVER_CPU:.0f} CPU, {REFERENCE_SERVER_MEMORY:.0f} GB each):"
+    )
+    expected_cpu, expected_memory = expected_offered_load(config)
+    if horizon > 0:
+        observed_cpu, observed_memory = observed_offered_load(specs, horizon)
+        print(f"  Observed CPU load: {observed_cpu:.3f}   Expected: {expected_cpu:.3f}")
+        print(f"  Observed RAM load: {observed_memory:.3f}   Expected: {expected_memory:.3f}")
+    else:
+        print(f"  Expected CPU load: {expected_cpu:.3f}")
+        print(f"  Expected RAM load: {expected_memory:.3f}")
+    if config.burst is not None:
+        quiet_cpu, quiet_memory = expected_offered_load(config, rate=config.arrival_rate)
+        burst_cpu, burst_memory = expected_offered_load(config, rate=config.burst.burst_rate)
+        print(f"  Expected CPU load: quiet {quiet_cpu:.3f}, burst {burst_cpu:.3f}")
+        print(f"  Expected RAM load: quiet {quiet_memory:.3f}, burst {burst_memory:.3f}")
+    print("  (offered load is demand relative to capacity; measured utilisation cannot exceed 1)")
+
+
+def reference_servers() -> list[Server]:
+    return [
+        Server(id=i, cpu_capacity=REFERENCE_SERVER_CPU, memory_capacity=REFERENCE_SERVER_MEMORY)
+        for i in range(1, REFERENCE_SERVER_COUNT + 1)
+    ]
+
+
+def print_seed_comparison(profile: str, seeds: list[int], horizon: int) -> None:
+    """Same profile, different seeds: same expected values, different sampled jobs."""
+    if horizon <= 0:
+        raise ValueError("horizon must be > 0 to compare seeds")
+    rows = []
+    for seed in seeds:
+        specs = generate_workload(profile_config(profile, seed, horizon))
+        validate_workload(specs, reference_servers())
+        cpu_load, memory_load = observed_offered_load(specs, horizon)
+        rows.append((seed, specs, cpu_load, memory_load))
+
+    print(f"Workload profile: {profile}, arrival horizon: {horizon} timesteps")
+    print(f"{'seed':>6} {'jobs':>6} {'mean CPU':>9} {'mean RAM':>9} {'mean dur':>9} "
+          f"{'CPU load':>9} {'RAM load':>9}")
+    for seed, specs, cpu_load, memory_load in rows:
+        print(f"{seed:>6} {len(specs):>6} "
+              f"{fmean(s.cpu_required for s in specs):>9.2f} "
+              f"{fmean(s.memory_required for s in specs):>9.2f} "
+              f"{fmean(s.duration for s in specs):>9.2f} "
+              f"{cpu_load:>9.3f} {memory_load:>9.3f}")
+
+    config = profile_config(profile, seeds[0], horizon)
+    expected_cpu, expected_memory = expected_offered_load(config)
+    print(f"{'expect':>6} {config.arrival_rates().sum():>6.0f} "
+          f"{config.cpu.expected_value():>9.2f} {config.memory.expected_value():>9.2f} "
+          f"{config.duration.expected_value():>9.2f} {expected_cpu:>9.3f} {expected_memory:>9.3f}")
+    print()
+    for seed, specs, _, _ in rows:
+        first = ", ".join(f"(t={s.arrival_time}, dur={s.duration}, cpu={s.cpu_required:.1f})"
+                          for s in specs[:3])
+        print(f"seed {seed} first 3 jobs: {first}")
+    print()
+    print("Every job fits on at least one reference server "
+          f"({REFERENCE_SERVER_COUNT} x {REFERENCE_SERVER_CPU:.0f} CPU / "
+          f"{REFERENCE_SERVER_MEMORY:.0f} GB).")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--workload", choices=PROFILES, help="workload profile")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="random seed(s), used with --workload; give two or more to compare (default 42)",
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=1000,
+        help="arrival horizon in timesteps, used with --workload (default 1000)",
+    )
+    args = parser.parse_args()
+
+    if args.workload is None:
+        run_deterministic_demo()
+        return
+    try:
+        if len(args.seed) == 1:
+            print_workload_summary(args.workload, args.seed[0], args.timesteps)
+        else:
+            print_seed_comparison(args.workload, args.seed, args.timesteps)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
