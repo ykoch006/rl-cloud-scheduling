@@ -84,10 +84,12 @@ class SimulationMetrics:
     def censored_average_waiting_time(self) -> float | None:
         """Mean wait over every job that arrived, including unfinished ones.
 
-        A job still queued at the end has only waited "at least" end - arrival
-        so far (its wait is right-censored). That value is used, so this is a
-        lower bound on the true average wait. Unlike average_waiting_time, it
-        cannot look better just because the slowest jobs never started.
+        Every job that has started (completed or still running) uses its real
+        wait, start - arrival. A job that never started has only waited "at
+        least" end - arrival (its wait is right-censored), and that value is
+        used, so this is a lower bound on the true average wait. Unlike
+        average_waiting_time, it cannot look better just because the slowest
+        jobs never started.
         """
         waits = [
             job.waiting_time if job.start_time is not None
@@ -99,7 +101,7 @@ class SimulationMetrics:
 
     @property
     def p95_waiting_time(self) -> float | None:
-        """95th percentile wait among completed jobs."""
+        """95th percentile wait among completed jobs (NumPy's linear interpolation)."""
         waits = [job.waiting_time for job in self.completed_jobs]
         return float(np.percentile(waits, 95)) if waits else None
 
@@ -115,9 +117,16 @@ class SimulationMetrics:
             return None
         return fmean(job.completion_time - job.arrival_time for job in self.completed_jobs)
 
-    @property
-    def average_queue_length(self) -> float:
-        return fmean(self.queue_length) if self.queue_length else 0.0
+    def average_queue_length_over(self, ticks: int) -> float:
+        """Mean queue length over the first `ticks` ticks.
+
+        Uses the same window as average_utilisation_over. Ticks after the run
+        ended had an empty queue and count as 0.
+        """
+        if ticks <= 0:
+            return 0.0
+        idle = [0] * max(0, ticks - len(self.queue_length))
+        return fmean(self.queue_length[:ticks] + idle)
 
     @property
     def average_cpu_utilisation(self) -> float:
@@ -135,11 +144,15 @@ class SimulationMetrics:
         Runs end at different times for different policies, and the drain
         period after arrivals stop is mostly idle. Comparing policies over the
         same fixed window (normally the arrival horizon) avoids penalising a
-        policy just for running longer.
+        policy just for running longer. If the run ended before `ticks`, the
+        cluster was empty for the rest of the window, so those ticks count as 0.
         """
-        cpu = self.cluster_cpu_utilisation[:ticks]
-        memory = self.cluster_memory_utilisation[:ticks]
-        return (fmean(cpu) if cpu else 0.0, fmean(memory) if memory else 0.0)
+        if ticks <= 0:
+            return 0.0, 0.0
+        idle = [0.0] * max(0, ticks - len(self.cluster_cpu_utilisation))
+        cpu = self.cluster_cpu_utilisation[:ticks] + idle
+        memory = self.cluster_memory_utilisation[:ticks] + idle
+        return fmean(cpu), fmean(memory)
 
     def average_server_cpu_utilisation(self, server_id: int) -> float:
         """Mean CPU utilisation of one server over all timesteps."""

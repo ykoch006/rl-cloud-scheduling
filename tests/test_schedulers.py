@@ -205,7 +205,7 @@ POLICIES = [
 
 
 @pytest.mark.parametrize("make_scheduler", POLICIES)
-@pytest.mark.parametrize("profile", ["light", "heavy"])
+@pytest.mark.parametrize("profile", ["light", "heavy", "bursty"])
 def test_every_policy_respects_capacity_and_timing(make_scheduler, profile):
     specs = generate_workload(profile_config(profile, seed=11, horizon=150))
     jobs = instantiate_jobs(specs)

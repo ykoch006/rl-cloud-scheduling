@@ -11,8 +11,13 @@ from env.server import Server
 from env.simulator import Simulator
 from env.workload import DETERMINISTIC_WORKLOAD, JobSpec, instantiate_jobs, validate_workload
 from env.workload_generator import (
+    BURSTY_QUIET_RATE,
+    BURSTY_SCHEDULE,
     DEFAULT_CPU,
     PROFILE_ARRIVAL_RATES,
+    PROFILES,
+    BurstSchedule,
+    quiet_rate_for_average,
     REFERENCE_SERVER_CPU,
     REFERENCE_SERVER_MEMORY,
     TruncatedExponentialDuration,
@@ -301,7 +306,7 @@ def spec(job_id=1, arrival_time=0, duration=3, cpu=10.0, memory=4.0) -> JobSpec:
                    cpu_required=cpu, memory_required=memory)
 
 
-@pytest.mark.parametrize("profile", sorted(PROFILE_ARRIVAL_RATES))
+@pytest.mark.parametrize("profile", PROFILES)
 def test_generated_profiles_pass_validation(profile):
     specs = generate_workload(profile_config(profile, seed=3, horizon=300))
 
@@ -341,3 +346,119 @@ def test_fit_check_uses_the_configured_servers_not_a_fixed_reference():
     with pytest.raises(ValueError, match=r"\[1\]"):
         validate_workload(job, small_cluster)
     validate_workload(job, big_cluster)
+
+
+# --- Bursty profile ----------------------------------------------------------
+
+
+def bursty(seed=42, horizon=300) -> WorkloadConfig:
+    return profile_config("bursty", seed=seed, horizon=horizon)
+
+
+def test_bursty_rate_switches_exactly_at_burst_boundaries():
+    rates = bursty(horizon=300).arrival_rates()
+
+    quiet, burst = BURSTY_QUIET_RATE, BURSTY_SCHEDULE.burst_rate
+    assert [rates[t] for t in (0, 79, 80, 99, 100, 179, 180, 199, 200)] == [
+        quiet, quiet, burst, burst, quiet, quiet, burst, burst, quiet
+    ]
+
+
+def test_bursty_cycle_averages_to_the_medium_rate():
+    config = bursty(horizon=500)
+
+    assert config.mean_arrival_rate() == pytest.approx(PROFILE_ARRIVAL_RATES["medium"])
+    assert expected_offered_load(config) == pytest.approx(
+        expected_offered_load(profile_config("medium", seed=42, horizon=500))
+    )
+
+
+def test_bursts_overload_the_cluster_but_quiet_periods_do_not():
+    config = bursty()
+    quiet_cpu, _ = expected_offered_load(config, rate=config.arrival_rate)
+    burst_cpu, _ = expected_offered_load(config, rate=config.burst.burst_rate)
+
+    assert quiet_cpu < 1.0 < burst_cpu
+
+
+def test_horizon_ending_mid_burst_averages_only_the_ticks_it_contains():
+    config = bursty(horizon=90)
+
+    assert config.arrival_rates()[-1] == BURSTY_SCHEDULE.burst_rate
+    expected = (80 * BURSTY_QUIET_RATE + 10 * BURSTY_SCHEDULE.burst_rate) / 90
+    assert config.mean_arrival_rate() == pytest.approx(expected)
+    assert all(s.arrival_time < 90 for s in generate_workload(config))
+
+
+def test_zero_horizon_bursty_has_no_jobs_but_a_defined_average_rate():
+    config = bursty(horizon=0)
+
+    assert generate_workload(config) == ()
+    assert config.mean_arrival_rate() == pytest.approx(PROFILE_ARRIVAL_RATES["medium"])
+
+
+def test_burst_can_start_at_tick_zero_and_end_at_the_period_edge():
+    ends_at_edge = WorkloadConfig(
+        seed=1, horizon=12, arrival_rate=1.0,
+        burst=BurstSchedule(period=5, burst_start=2, burst_length=3, burst_rate=4.0),
+    )
+    starts_at_zero = WorkloadConfig(
+        seed=1, horizon=6, arrival_rate=1.0,
+        burst=BurstSchedule(period=5, burst_start=0, burst_length=1, burst_rate=4.0),
+    )
+
+    assert list(ends_at_edge.arrival_rates()) == [1, 1, 4, 4, 4, 1, 1, 4, 4, 4, 1, 1]
+    assert list(starts_at_zero.arrival_rates()) == [4, 1, 1, 1, 1, 4]
+
+
+def test_bursty_workload_is_reproducible_and_seed_dependent():
+    assert generate_workload(bursty(seed=7)) == generate_workload(bursty(seed=7))
+    assert generate_workload(bursty(seed=7)) != generate_workload(bursty(seed=8))
+
+
+def test_arrivals_are_concentrated_in_burst_ticks():
+    config = bursty(seed=3, horizon=2000)
+    arrivals = Counter(spec.arrival_time for spec in generate_workload(config))
+    burst_ticks = [t for t in range(config.horizon) if config.burst.in_burst(t)]
+    quiet_ticks = [t for t in range(config.horizon) if not config.burst.in_burst(t)]
+
+    burst_mean = fmean(arrivals.get(t, 0) for t in burst_ticks)
+    quiet_mean = fmean(arrivals.get(t, 0) for t in quiet_ticks)
+
+    # Expected 5.0 versus 1.875 per tick; requiring a ratio above 2 leaves a
+    # wide margin, so this does not depend on the sample hitting the mean.
+    assert burst_mean > 2 * quiet_mean
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (dict(period=10, burst_start=0, burst_length=0, burst_rate=5.0), "burst_length"),
+        (dict(period=10, burst_start=-1, burst_length=2, burst_rate=5.0), "burst_start"),
+        (dict(period=10, burst_start=8, burst_length=3, burst_rate=5.0), "fit inside"),
+        (dict(period=0, burst_start=0, burst_length=1, burst_rate=5.0), "fit inside"),
+        (dict(period=10.5, burst_start=0, burst_length=1, burst_rate=5.0), "integer"),
+        (dict(period=10, burst_start=0, burst_length=1, burst_rate=float("nan")), "burst_rate"),
+        (dict(period=10, burst_start=0, burst_length=1, burst_rate=-1.0), "burst_rate"),
+    ],
+)
+def test_invalid_burst_schedule_is_rejected(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        BurstSchedule(**kwargs)
+
+
+def test_burst_rate_must_exceed_the_normal_rate():
+    schedule = BurstSchedule(period=10, burst_start=0, burst_length=2, burst_rate=2.0)
+
+    with pytest.raises(ValueError, match="higher"):
+        WorkloadConfig(seed=1, horizon=10, arrival_rate=2.0, burst=schedule)
+
+
+def test_quiet_rate_for_average_rejects_impossible_schedules():
+    all_burst = BurstSchedule(period=5, burst_start=0, burst_length=5, burst_rate=3.0)
+    too_strong = BurstSchedule(period=10, burst_start=0, burst_length=5, burst_rate=10.0)
+
+    with pytest.raises(ValueError, match="quiet"):
+        quiet_rate_for_average(2.5, all_burst)
+    with pytest.raises(ValueError, match="exceeds"):
+        quiet_rate_for_average(2.5, too_strong)

@@ -19,7 +19,7 @@ heuristics, and under which workload conditions RL gives a real advantage.
    window, plus strict FCFS as a reference. See
    [Scheduling policies](#scheduling-policies).
 
-Not yet implemented: bursty and stress workload profiles, deadlines, energy,
+Not yet implemented: the stress workload profile, deadlines, energy,
 the Gymnasium environment, RL agents and autoscaling.
 
 ## Architecture
@@ -157,7 +157,8 @@ python main.py
 ```
 
 Runs the fixed 10-job workload with `fcfs-backfill` on three servers and
-prints every event, then a summary ending:
+prints every event, then a summary. The demo has no separate drain period,
+so its utilisation figures are averaged over the whole run. The summary ends:
 
 ```
 === Summary (fcfs-backfill) ===
@@ -178,12 +179,12 @@ the arrival rate λ is the expected number of new jobs per tick.
 **Arrivals.** At each tick `t` from `0` to `horizon - 1`, the number of
 arriving jobs is
 
-    N_t ~ Poisson(lambda)
+    N_t ~ Poisson(lambda_t)
 
 so a tick can have zero, one or several arrivals. No job arrives at or after
 `horizon`. Jobs are numbered 1, 2, 3, ... in arrival order. The rate is
-constant for now. `WorkloadConfig.arrival_rates()` returns one rate per
-tick, so a time-varying rate only needs a change there.
+constant for light, medium and heavy, and changes over time for bursty;
+`WorkloadConfig.arrival_rates()` returns the rate for every tick.
 
 **Job properties.** Each job independently gets:
 
@@ -224,18 +225,30 @@ jobs_for_run_b = instantiate_jobs(specs)   # same arrivals and demands
 ### Profiles
 
 A workload is fully described by one frozen `WorkloadConfig`: `seed`,
-`horizon`, `arrival_rate`, and the `cpu`, `memory` and `duration`
-distributions. Invalid values raise a `ValueError` naming the parameter.
+`horizon`, `arrival_rate`, the `cpu`, `memory` and `duration`
+distributions, and an optional `burst` schedule. Invalid values raise a
+`ValueError` naming the parameter.
 
 | Profile | Jobs per tick | Expected CPU load* | Expected RAM load* | Target band |
 |---|---|---|---|---|
 | light | 1.6 | 0.456 | 0.311 | 40–50% |
 | medium | 2.5 | 0.712 | 0.486 | 65–75% |
 | heavy | 3.2 | 0.912 | 0.622 | 85–95% |
+| bursty | 1.875, or 5.0 in ticks 80–99 of every 100 | 0.712 on average (0.534 quiet, 1.425 burst) | 0.486 on average | medium average with temporary overload |
 
-\* On 5 reference servers. Offered load = arrival rate × E[demand ×
-duration] / total cluster capacity. The target bands are development
-targets, not measured cloud workload levels.
+\* On 5 reference servers. Offered load = mean arrival rate over the
+horizon × E[demand × duration] / total cluster capacity. The target bands
+are development targets, not measured cloud workload levels.
+
+**Bursty.** The scope asks for alternating normal and peak periods with a
+medium average and temporary overload, but gives no numbers. The 100-tick
+cycle, the 20-tick burst at the end of each cycle and the burst rate of 5.0
+are assumptions. The quiet rate of 1.875 is derived so a whole cycle averages
+2.5 jobs per tick, the same as medium. Bursty's average offered load only
+equals medium's when the horizon is a whole number of cycles. Offered load
+during a burst is above 1, but measured utilisation can never exceed 1: the
+excess waits in the queue. See
+[docs/MODEL_ASSUMPTIONS.md](docs/MODEL_ASSUMPTIONS.md#bursty-profile).
 
 ### Inspecting workloads
 
@@ -255,6 +268,13 @@ Compares two seeds of the same profile side by side. Over 200 ticks the
 observed CPU load was 0.608 for seed 1 and 0.758 for seed 2 against an
 expected 0.712, which is why results should be averaged over many seeds.
 
+```bash
+python main.py --workload bursty --seed 42 --timesteps 500
+```
+
+For bursty, the summary also shows the quiet and burst rates and the
+expected load in each period.
+
 ## Comparing policies
 
 ```bash
@@ -264,15 +284,78 @@ python -m evaluation.runner --workload heavy --seeds 0 1 2 3 4 --timesteps 500 -
 For each seed, the workload is generated once and validated, then every
 policy runs on its own fresh copy of the jobs, a fresh cluster and a fresh
 scheduler, with the same arrival horizon and maximum drain period.
-Utilisation is averaged over the arrival horizon only, so a policy is not
-penalised just for running longer. The table shows the mean over seeds;
-paired per-seed comparisons with confidence intervals are planned.
+
+**How the table is aggregated.** Every column is first computed separately
+for each workload seed, then averaged over seeds, with every seed weighted
+equally regardless of how many jobs it has. Paired per-seed comparisons with
+confidence intervals are planned.
+
+| Column | Per seed | Jobs or ticks included |
+|---|---|---|
+| completed % | completed jobs / all jobs in the workload | all jobs |
+| unfinished | jobs still queued, running or not yet arrived when the run stopped | all jobs |
+| wait (done) | mean of start − arrival | completed jobs only |
+| wait (all) | mean wait: start − arrival for every started job (completed or still running); run end − arrival for jobs that never started (a lower bound) | every job that arrived before the run ended |
+| p95 wait | 95th percentile of start − arrival (NumPy linear interpolation) | completed jobs only |
+| turnaround | mean of completion − arrival | completed jobs only |
+| queue | mean queue length after scheduling | ticks 0 to T−1 only |
+| CPU %, RAM % | mean capacity-weighted cluster utilisation | ticks 0 to T−1 only |
+
+T is the arrival horizon (`--timesteps`). **Queue length and CPU/RAM
+utilisation are measured over the arrival horizon only; drain ticks are not
+included**, so every policy is measured over the same window. If a run
+finishes before T, the remaining ticks count as idle with an empty queue.
+
+Two consequences:
+- **"p95 wait" is the mean of the per-seed 95th percentiles,** not the 95th
+  percentile of all jobs pooled. For bursty FCFS-backfill over seeds 0–9,
+  the table gives 6.30, the pooled value is 7.0, and the per-seed values
+  range from 3 to 10. Waits are whole ticks, so values like 6.30 come from
+  interpolation and averaging.
+- **"wait (done)" is the mean of per-seed means,** not a mean over all jobs
+  pooled: 1.13 versus 1.14 in the same case. A seed with no completed jobs
+  would have no wait value and would be left out of these columns. That did
+  not happen in any run reported here.
+
+```bash
+python -m evaluation.runner --workload bursty --seeds 0 1 2 3 4 5 6 7 8 9 --timesteps 1000 --drain 500
+```
+
+For bursty workloads the runner also prints the mean queue length in each
+10-tick part of the 100-tick cycle (burst ticks marked `*`), averaged over
+complete cycles inside the arrival horizon and over seeds.
+
+**Results from that command (10 seeds).** These are descriptive means, not
+statistically tested differences. Every job finished in every run, so
+"wait (done)" and "wait (all)" are equal. Both columns below are means over
+seeds of per-seed values, in ticks; the medium columns come from the same
+command with `--workload medium`.
+
+| Policy | Bursty mean wait | Bursty mean of per-seed p95 | Medium mean wait | Medium mean of per-seed p95 |
+|---|---|---|---|---|
+| fcfs-backfill | 1.13 | 6.30 | 0.23 | 0.79 |
+| sjf | 0.81 | 4.30 | 0.23 | 0.40 |
+| best-fit | 1.09 | 6.30 | 0.22 | 0.89 |
+| round-robin | 1.15 | 6.30 | 0.35 | 1.00 |
+| random-valid | 1.12 | 6.00 | 0.36 | 0.61 |
+| fcfs-strict (reference) | 3.68 | 14.50 | 1.24 | 7.30 |
+
+Bursty and medium have the same average offered load, yet waits are several
+times longer under bursty, so the timing of demand matters, not just its
+average. For the primary policies the mean queue was 8–11 jobs over the
+last 10 burst ticks (90–99) and then fell during the quiet period, before
+the next burst. It was below 0.3 jobs from ticks 40–49 onwards for
+fcfs-backfill, SJF and best-fit, from 50–59 for round-robin, and only by
+70–79 for random-valid. Strict FCFS still averaged about 0.7 jobs at the end
+of the quiet period. These are averages over cycles and seeds: individual
+cycles were not checked, and the 0–9 bucket includes the first cycle, which
+has no burst before it.
 
 ## Provisional and not yet implemented
 
 - All workload parameters are development assumptions, to be calibrated
   later, including against the Alibaba cluster trace.
-- Bursty and stress profiles.
+- The stress profile.
 - Deadlines, energy, correlated CPU/RAM demands.
 - Starvation checks for large jobs under the feasible-only window (scheduled
   with the Gymnasium work).

@@ -18,10 +18,11 @@ from env.server import Server
 from env.simulator import Scheduler, SimulationMetrics, Simulator
 from env.workload import JobSpec, instantiate_jobs, validate_workload
 from env.workload_generator import (
-    PROFILE_ARRIVAL_RATES,
+    PROFILES,
     REFERENCE_SERVER_COUNT,
     REFERENCE_SERVER_CPU,
     REFERENCE_SERVER_MEMORY,
+    BurstSchedule,
     generate_workload,
     profile_config,
 )
@@ -97,10 +98,15 @@ def _mean(values: list[float | None]) -> float:
 
 
 def summarise(results: list[RunResult], horizon: int) -> list[dict]:
-    """One row per policy: each metric averaged over workload seeds.
+    """One row per policy: each metric is computed per seed, then averaged.
 
-    Every seed counts equally. This is a first descriptive summary; paired
-    per-seed comparisons with confidence intervals are planned separately.
+    Every seed counts equally, whatever its job count. So "p95 wait" is the
+    mean of the per-seed 95th percentiles, not the 95th percentile of all jobs
+    pooled together, and "wait (done)" is the mean of per-seed means. A seed
+    with no completed jobs has no wait value and is left out of those columns.
+    Queue length and utilisation use ticks 0..horizon-1 only; drain ticks are
+    excluded. This is a first descriptive summary; paired per-seed comparisons
+    with confidence intervals are planned separately.
     """
     rows = []
     for policy in dict.fromkeys(r.policy for r in results):
@@ -114,24 +120,54 @@ def summarise(results: list[RunResult], horizon: int) -> list[dict]:
             "wait (all)": _mean([m.censored_average_waiting_time for m in runs]),
             "p95 wait": _mean([m.p95_waiting_time for m in runs]),
             "turnaround": _mean([m.average_turnaround_time for m in runs]),
-            "queue": _mean([m.average_queue_length for m in runs]),
+            "queue": _mean([m.average_queue_length_over(horizon) for m in runs]),
             "CPU %": 100 * _mean([cpu for cpu, _ in utilisation]),
             "RAM %": 100 * _mean([memory for _, memory in utilisation]),
         })
     return rows
 
 
-def print_table(rows: list[dict]) -> None:
+def queue_by_cycle_phase(
+    results: list[RunResult], schedule: BurstSchedule, horizon: int, bucket: int = 10
+) -> list[dict]:
+    """Mean queue length at each position in the burst cycle, one row per policy.
+
+    Only complete cycles inside the arrival horizon are used, so every bucket
+    averages the same number of ticks. If a run finished before the horizon,
+    the missing ticks had an empty queue and count as 0.
+    """
+    full_cycles = horizon // schedule.period
+    if full_cycles == 0:
+        raise ValueError("the arrival horizon is shorter than one burst cycle")
+    rows = []
+    for policy in dict.fromkeys(r.policy for r in results):
+        queues = [r.metrics.queue_length for r in results if r.policy == policy]
+        row = {"policy": policy}
+        for start in range(0, schedule.period, bucket):
+            phases = range(start, min(start + bucket, schedule.period))
+            values = [
+                queue[tick] if tick < len(queue) else 0
+                for queue in queues
+                for cycle in range(full_cycles)
+                for tick in (cycle * schedule.period + phase for phase in phases)
+            ]
+            marker = "*" if any(schedule.in_burst(p) for p in phases) else ""
+            row[f"{start}-{phases[-1]}{marker}"] = fmean(values)
+        rows.append(row)
+    return rows
+
+
+def print_table(rows: list[dict], width: int = 13) -> None:
     columns = list(rows[0])
-    print("  ".join(f"{c:>13}" for c in columns))
+    print("  ".join([f"{columns[0]:>13}"] + [f"{c:>{width}}" for c in columns[1:]]))
     for row in rows:
-        cells = [f"{row['policy']:>13}"] + [f"{row[c]:>13.2f}" for c in columns[1:]]
+        cells = [f"{row['policy']:>13}"] + [f"{row[c]:>{width}.2f}" for c in columns[1:]]
         print("  ".join(cells))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--workload", choices=sorted(PROFILE_ARRIVAL_RATES), default="medium")
+    parser.add_argument("--workload", choices=PROFILES, default="medium")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--timesteps", type=int, default=500, help="arrival horizon (default 500)")
     parser.add_argument("--drain", type=int, default=DEFAULT_DRAIN,
@@ -143,16 +179,27 @@ def main() -> None:
     print(f"Profile {args.workload}, seeds {args.seeds}, arrival horizon {args.timesteps}, "
           f"max drain {args.drain}, {REFERENCE_SERVER_COUNT} servers x "
           f"{REFERENCE_SERVER_CPU:.0f} CPU / {REFERENCE_SERVER_MEMORY:.0f} GB")
-    print("Means over seeds. 'wait (done)' counts completed jobs only; 'wait (all)' also counts")
-    print("unfinished jobs' waits so far (a lower bound). Utilisation is over the arrival horizon.")
+    print("Each value is computed per seed, then averaged over seeds (seeds weighted equally).")
+    print("'wait (done)', 'p95 wait' and 'turnaround' use completed jobs only; 'wait (all)' also")
+    print("counts unfinished jobs' waits so far (a lower bound). 'queue', 'CPU %' and 'RAM %'")
+    print(f"are averaged over ticks 0-{args.timesteps - 1} (the arrival horizon); drain ticks are excluded.")
     print()
+    primary = compare_policies(args.workload, args.seeds, args.timesteps, args.drain)
+    reference = compare_policies(args.workload, args.seeds, args.timesteps, args.drain,
+                                 REFERENCE_POLICIES)
     print("Primary policies (shared five-job feasible window):")
-    print_table(summarise(compare_policies(args.workload, args.seeds, args.timesteps, args.drain),
-                          args.timesteps))
+    print_table(summarise(primary, args.timesteps))
     print()
     print("Reference policy (sees the blocked head of the queue):")
-    print_table(summarise(compare_policies(args.workload, args.seeds, args.timesteps, args.drain,
-                                           REFERENCE_POLICIES), args.timesteps))
+    print_table(summarise(reference, args.timesteps))
+
+    config = profile_config(args.workload, args.seeds[0], args.timesteps)
+    if config.burst is not None and args.timesteps >= config.burst.period:
+        print()
+        print(f"Mean queue length by tick within each {config.burst.period}-tick cycle "
+              f"(* = burst ticks), over complete cycles in the arrival horizon:")
+        print_table(queue_by_cycle_phase(primary + reference, config.burst, args.timesteps),
+                    width=7)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ length; it is the unit of both arrival time and job duration.
 | Server CPU capacity | 100 units | SOURCE | PID §2.3 |
 | Server RAM capacity | 64 GB | SOURCE | PID §2.3 |
 | Reference cluster size (for offered load) | 5 servers | SOURCE | Lower end of the PID's 5–10 range |
-| Arrival process | Poisson count per timestep | SOURCE | PID §2.3. Time-varying rate not implemented yet |
+| Arrival process | Poisson count per timestep | SOURCE | PID §2.3; time-varying λ_t used by the bursty profile |
 | CPU / RAM demand family | Log-normal | SOURCE | PID §2.3 |
 | Duration family | Exponential | SOURCE | PID §2.3 |
 | Maximum CPU demand | 100 units | DERIVED | One server's capacity, so every job can run somewhere |
@@ -53,6 +53,11 @@ length; it is the unit of both arrival time and job duration.
 | Maximum duration | 100 timesteps | ASSUMPTION | |
 | Target CPU load bands | light 40–50%, medium 65–75%, heavy 85–95% | ASSUMPTION | Scope §3.5; development targets, not cloud standards |
 | Light / medium / heavy arrival rate | 1.6 / 2.5 / 3.2 jobs per tick | DERIVED | Chosen so the expected CPU load lands inside each target band |
+| Bursty profile shape | alternating quiet and burst periods, medium average, temporary overload | SOURCE | Scope §3.3B and §3.5 (no numbers given) |
+| Burst cycle length | 100 ticks | ASSUMPTION | |
+| Burst position and length | ticks 80–99 of each cycle (20 ticks) | ASSUMPTION | Quiet first, so runs do not start in overload |
+| Burst arrival rate | 5.0 jobs per tick | ASSUMPTION | Expected CPU load 1.425 during a burst, i.e. overload |
+| Quiet arrival rate | 1.875 jobs per tick | DERIVED | (2.5 × 100 − 5.0 × 20) / 80, so a full cycle averages medium's 2.5 |
 | CPU and RAM independent | — | ASSUMPTION | Real traces show correlation |
 | Demand independent of duration | — | ASSUMPTION | Needed for E[demand × duration] = E[demand] × E[duration] |
 | Rejection guard | Bounds must keep ≥ 50% of the distribution | ASSUMPTION | Catches mistaken parameters |
@@ -83,8 +88,48 @@ with a 200-tick horizon, medium gave an observed CPU load of 0.608 for seed 1
 and 0.758 for seed 2, because CPU × duration has a heavy right tail. Results
 should therefore be averaged over many seeds.
 
-Not yet implemented from the scope: the bursty profile (alternating normal
-and peak periods with a medium average) and the stress profile.
+### Bursty profile
+
+N_t ~ Poisson(λ_t), where λ_t = 5.0 in ticks 80–99 of every 100-tick cycle
+and 1.875 otherwise. Job demands and durations use the same distributions as
+every other profile.
+
+| Period | Arrival rate | Expected CPU load | Expected RAM load |
+|---|---|---|---|
+| quiet (80 ticks per cycle) | 1.875 | 0.534 | 0.364 |
+| burst (20 ticks per cycle) | 5.0 | 1.425 | 0.972 |
+| average over whole cycles | 2.5 | 0.712 | 0.486 |
+
+The expected offered load over a horizon is the average of λ_t over the
+ticks in that horizon, so it equals medium's 0.712 only when the horizon is
+a whole number of cycles. For example, 250 ticks ends in a quiet period and
+gives 0.677. The code computes this from the schedule
+(`WorkloadConfig.mean_arrival_rate`).
+
+**Offered load is not measured utilisation.** Offered load is demand
+relative to capacity and can exceed 1, as it does during bursts. Measured
+utilisation is the fraction of capacity actually reserved and can never
+exceed 1. Demand above capacity waits in the queue and is served later.
+
+In the policy comparisons, utilisation is measured over the arrival horizon
+only (ticks 0 to T−1); drain ticks are excluded. Over seeds 0–9 with
+T = 1,000, FCFS-backfill's measured CPU utilisation was 68.85% (bursty) and
+69.82% (medium), below the expected 71.2%. Two measured effects account for
+this:
+
+1. **These seeds' realised offered load was lower than expected:** 0.705
+   (bursty) and 0.706 (medium) on average, rather than 0.712.
+2. **Some work finishes after the horizon:** 2.3% (bursty) and 1.1%
+   (medium) of all reserved CPU-time fell in the drain period, so it is not
+   counted in the horizon window.
+
+Utilisation over the horizon equals realised offered load × (1 − share of
+work in the drain): 0.705 × (1 − 0.023) ≈ 0.689 for bursty, matching the
+measured 68.85%. Over the whole run including drain, the same runs averaged
+67.34% (bursty) and 68.07% (medium), lower again because the drain ticks are
+mostly idle.
+
+Not yet implemented from the scope: the stress profile.
 
 ## Scheduling assumptions
 
@@ -96,7 +141,8 @@ and peak periods with a medium average) and the stress profile.
 | Best-Fit score | sum of CPU and RAM left over, each divided by capacity | ASSUMPTION | One documented scoring function, as the scope requires |
 | Random-valid seed | the workload seed | ASSUMPTION | Its own generator, separate from the workload's streams |
 | Drain period in comparisons | 500 ticks | ASSUMPTION | Scope §7.1 provisional value |
-| Utilisation window in comparisons | the arrival horizon | DERIVED | Same window for every policy |
+| Utilisation and queue-length window in comparisons | ticks 0 to T−1 (arrival horizon); drain ticks excluded | DERIVED | Same window for every policy; ticks after an early finish count as idle |
+| Aggregation over seeds | compute each metric per seed, then take the unweighted mean of seeds | ASSUMPTION | p95 is a mean of per-seed percentiles, not a pooled percentile |
 
 ## Modelling choices to review
 

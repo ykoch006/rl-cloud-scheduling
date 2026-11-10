@@ -3,8 +3,9 @@
 A workload is generated in two steps:
 
 1. Arrivals: at each timestep t in 0..horizon-1, the number of new jobs is
-   N_t ~ Poisson(lambda_t). Jobs arriving at the same timestep are numbered
-   in generation order, so ids follow arrival order.
+   N_t ~ Poisson(lambda_t). lambda_t is constant unless the config has a
+   burst schedule. Jobs arriving at the same timestep are numbered in
+   generation order, so ids follow arrival order.
 2. Job properties: each job independently gets a CPU demand and a RAM demand
    (truncated log-normal) and a duration (rounded-up, truncated exponential).
 
@@ -169,6 +170,38 @@ DEFAULT_DURATION = TruncatedExponentialDuration(mean=10.0, maximum=100)
 
 
 @dataclass(frozen=True)
+class BurstSchedule:
+    """A repeating cycle of `period` ticks with one burst of higher arrivals.
+
+    Within each cycle, ticks burst_start .. burst_start + burst_length - 1
+    use `burst_rate`; every other tick uses the config's normal arrival_rate.
+    """
+
+    period: int
+    burst_start: int
+    burst_length: int
+    burst_rate: float
+
+    def __post_init__(self) -> None:
+        for name in ("period", "burst_start", "burst_length"):
+            if not isinstance(getattr(self, name), int):
+                raise ValueError(f"{name} must be an integer, got {getattr(self, name)!r}")
+        if self.burst_length < 1 or self.burst_start < 0:
+            raise ValueError("burst_length must be >= 1 and burst_start must be >= 0")
+        if self.burst_start + self.burst_length > self.period:
+            raise ValueError(
+                f"burst (start {self.burst_start}, length {self.burst_length}) "
+                f"must fit inside the period of {self.period} ticks"
+            )
+        if not math.isfinite(self.burst_rate) or self.burst_rate < 0:
+            raise ValueError(f"burst_rate must be a finite number >= 0, got {self.burst_rate}")
+
+    def in_burst(self, tick: int) -> bool:
+        phase = tick % self.period
+        return self.burst_start <= phase < self.burst_start + self.burst_length
+
+
+@dataclass(frozen=True)
 class WorkloadConfig:
     """Everything needed to generate one workload.
 
@@ -182,6 +215,7 @@ class WorkloadConfig:
     cpu: TruncatedLogNormal = DEFAULT_CPU
     memory: TruncatedLogNormal = DEFAULT_MEMORY
     duration: TruncatedExponentialDuration = DEFAULT_DURATION
+    burst: BurstSchedule | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.seed, int) or self.seed < 0:
@@ -190,6 +224,11 @@ class WorkloadConfig:
             raise ValueError(f"horizon must be an integer >= 0, got {self.horizon!r}")
         if not math.isfinite(self.arrival_rate) or self.arrival_rate < 0:
             raise ValueError(f"arrival_rate must be a finite number >= 0, got {self.arrival_rate}")
+        if self.burst is not None and self.burst.burst_rate <= self.arrival_rate:
+            raise ValueError(
+                f"burst_rate ({self.burst.burst_rate}) must be higher than the normal "
+                f"arrival_rate ({self.arrival_rate})"
+            )
         if self.cpu.maximum > REFERENCE_SERVER_CPU:
             raise ValueError(
                 f"maximum CPU demand {self.cpu.maximum} exceeds one server's "
@@ -202,12 +241,26 @@ class WorkloadConfig:
             )
 
     def arrival_rates(self) -> np.ndarray:
-        """Expected number of arrivals at each timestep 0..horizon-1.
+        """Expected number of arrivals lambda_t at each timestep 0..horizon-1."""
+        return self._rates_for(self.horizon)
 
-        Constant for now. A time-varying rate (for example a bursty
-        profile) only needs to change this method.
+    def mean_arrival_rate(self) -> float:
+        """Average lambda_t over the arrival horizon.
+
+        With no horizon there are no ticks to average, so the long-run
+        average over one burst cycle (or the constant rate) is returned.
         """
-        return np.full(self.horizon, self.arrival_rate, dtype=float)
+        ticks = self.horizon
+        if ticks == 0:
+            ticks = self.burst.period if self.burst else 1
+        return float(np.mean(self._rates_for(ticks)))
+
+    def _rates_for(self, ticks: int) -> np.ndarray:
+        rates = np.full(ticks, self.arrival_rate, dtype=float)
+        if self.burst is not None:
+            in_burst = np.array([self.burst.in_burst(t) for t in range(ticks)], dtype=bool)
+            rates[in_burst] = self.burst.burst_rate
+        return rates
 
 
 def generate_workload(config: WorkloadConfig) -> tuple[JobSpec, ...]:
@@ -252,31 +305,61 @@ PROFILE_ARRIVAL_RATES: dict[str, float] = {
 }
 
 
+# Bursty profile: a medium average with temporary overload (scope §3.5). The
+# scope gives no numbers, so the cycle length, burst length, burst position and
+# burst rate are assumptions. Quiet ticks come first so a run does not start in
+# overload from an empty cluster.
+BURSTY_SCHEDULE = BurstSchedule(period=100, burst_start=80, burst_length=20, burst_rate=5.0)
+
+
+def quiet_rate_for_average(average_rate: float, schedule: BurstSchedule) -> float:
+    """Normal (non-burst) rate that makes one full cycle average `average_rate`."""
+    quiet_ticks = schedule.period - schedule.burst_length
+    if quiet_ticks == 0:
+        raise ValueError("a schedule that is all burst has no quiet ticks to adjust")
+    total = average_rate * schedule.period - schedule.burst_rate * schedule.burst_length
+    if total < 0:
+        raise ValueError("the burst alone exceeds the requested average rate")
+    return total / quiet_ticks
+
+
+BURSTY_QUIET_RATE = quiet_rate_for_average(PROFILE_ARRIVAL_RATES["medium"], BURSTY_SCHEDULE)
+
+PROFILES: tuple[str, ...] = (*PROFILE_ARRIVAL_RATES, "bursty")
+
+
 def profile_config(profile: str, seed: int, horizon: int) -> WorkloadConfig:
     """Return the WorkloadConfig for a named profile."""
-    if profile not in PROFILE_ARRIVAL_RATES:
-        raise ValueError(
-            f"Unknown workload profile {profile!r}; choose from {sorted(PROFILE_ARRIVAL_RATES)}"
+    if profile == "bursty":
+        return WorkloadConfig(
+            seed=seed, horizon=horizon, arrival_rate=BURSTY_QUIET_RATE, burst=BURSTY_SCHEDULE
         )
+    if profile not in PROFILE_ARRIVAL_RATES:
+        raise ValueError(f"Unknown workload profile {profile!r}; choose from {list(PROFILES)}")
     return WorkloadConfig(seed=seed, horizon=horizon, arrival_rate=PROFILE_ARRIVAL_RATES[profile])
 
 
 def expected_offered_load(
-    config: WorkloadConfig, server_count: int = REFERENCE_SERVER_COUNT
+    config: WorkloadConfig,
+    server_count: int = REFERENCE_SERVER_COUNT,
+    rate: float | None = None,
 ) -> tuple[float, float]:
     """Theoretical (CPU, RAM) offered load on `server_count` reference servers.
 
     offered load = arrival rate x E[demand x duration] / total capacity.
     Demand and duration are sampled independently, so
-    E[demand x duration] = E[demand] x E[duration].
+    E[demand x duration] = E[demand] x E[duration]. By default the arrival rate
+    is the average over the horizon; pass `rate` for the load at one rate, for
+    example during a burst.
     """
+    rate = config.mean_arrival_rate() if rate is None else rate
     mean_duration = config.duration.expected_value()
     cpu_load = (
-        config.arrival_rate * config.cpu.expected_value() * mean_duration
+        rate * config.cpu.expected_value() * mean_duration
         / (server_count * REFERENCE_SERVER_CPU)
     )
     memory_load = (
-        config.arrival_rate * config.memory.expected_value() * mean_duration
+        rate * config.memory.expected_value() * mean_duration
         / (server_count * REFERENCE_SERVER_MEMORY)
     )
     return cpu_load, memory_load
