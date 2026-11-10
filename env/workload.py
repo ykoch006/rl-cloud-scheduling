@@ -15,10 +15,12 @@ checked by hand. The jobs are sized for three servers with 100 CPU units and
   still waiting (jobs 7 and 9).
 """
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from env.job import Job
+from env.server import Server
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,40 @@ class JobSpec:
 def instantiate_jobs(specs: Sequence[JobSpec]) -> list[Job]:
     """Create fresh Job objects for a workload, one per spec."""
     return [spec.to_job() for spec in specs]
+
+
+def validate_workload(specs: Sequence[JobSpec], servers: Sequence[Server]) -> None:
+    """Raise ValueError if the workload cannot be simulated safely on `servers`.
+
+    A job that does not fit on any server even when that server is empty
+    would wait forever, so it is rejected here rather than silently
+    inflating the unfinished-job count.
+    """
+    ids = [spec.id for spec in specs]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Job ids must be unique")
+    arrival_times = [spec.arrival_time for spec in specs]
+    if arrival_times != sorted(arrival_times):
+        raise ValueError("Jobs must be listed in arrival order")
+
+    for spec in specs:
+        if spec.arrival_time < 0 or spec.duration < 1:
+            raise ValueError(f"Job {spec.id}: needs arrival_time >= 0 and duration >= 1")
+        demands = (spec.cpu_required, spec.memory_required)
+        if not all(math.isfinite(d) and d > 0 for d in demands):
+            raise ValueError(f"Job {spec.id}: CPU and RAM demands must be finite and > 0")
+
+    fits_nowhere = [
+        spec.id
+        for spec in specs
+        if not any(
+            spec.cpu_required <= server.cpu_capacity
+            and spec.memory_required <= server.memory_capacity
+            for server in servers
+        )
+    ]
+    if fits_nowhere:
+        raise ValueError(f"Jobs {fits_nowhere} do not fit on any server, even an empty one")
 
 
 # (arrival_time, duration, cpu_required, memory_required)

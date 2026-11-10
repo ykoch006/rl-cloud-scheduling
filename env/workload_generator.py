@@ -13,7 +13,7 @@ The result is a tuple of immutable `JobSpec`s. Use
 simulation run.
 
 All default parameter values are provisional development assumptions, not
-measured cloud statistics. See docs/assumptions.md.
+measured cloud statistics. See docs/MODEL_ASSUMPTIONS.md.
 """
 
 import math
@@ -240,13 +240,15 @@ def generate_workload(config: WorkloadConfig) -> tuple[JobSpec, ...]:
     )
 
 
-# Profiles currently differ only in arrival rate (jobs per timestep). These
-# are development settings, not calibrated workload levels; see
-# docs/assumptions.md for the offered load each one gives.
+# Profiles differ only in arrival rate (expected jobs per timestep). The rates
+# were chosen so the expected CPU offered load on the 5-server reference
+# cluster falls inside the scope's target bands (light 40-50%, medium 65-75%,
+# heavy 85-95%). They are development targets, not measured cloud load levels;
+# see docs/MODEL_ASSUMPTIONS.md.
 PROFILE_ARRIVAL_RATES: dict[str, float] = {
-    "light": 1.0,
-    "medium": 2.0,
-    "heavy": 3.0,
+    "light": 1.6,
+    "medium": 2.5,
+    "heavy": 3.2,
 }
 
 

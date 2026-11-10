@@ -9,9 +9,10 @@ from env.cluster import Cluster
 from env.job import JobStatus
 from env.server import Server
 from env.simulator import Simulator
-from env.workload import JobSpec, instantiate_jobs
+from env.workload import DETERMINISTIC_WORKLOAD, JobSpec, instantiate_jobs, validate_workload
 from env.workload_generator import (
     DEFAULT_CPU,
+    PROFILE_ARRIVAL_RATES,
     REFERENCE_SERVER_CPU,
     REFERENCE_SERVER_MEMORY,
     TruncatedExponentialDuration,
@@ -22,7 +23,7 @@ from env.workload_generator import (
     observed_offered_load,
     profile_config,
 )
-from schedulers.first_fit import FirstFitScheduler
+from schedulers.fcfs import FCFSScheduler
 
 
 def make_config(**overrides) -> WorkloadConfig:
@@ -106,10 +107,19 @@ def test_heavy_profile_generates_more_jobs_than_light_across_seeds():
     light = fmean(len(generate_workload(profile_config("light", s, horizon))) for s in seeds)
     heavy = fmean(len(generate_workload(profile_config("heavy", s, horizon))) for s in seeds)
 
-    # Expected job count is arrival_rate x horizon: 200 for light, 600 for heavy.
-    assert light == pytest.approx(1.0 * horizon, rel=0.05)
-    assert heavy == pytest.approx(3.0 * horizon, rel=0.05)
+    # Expected job count is arrival_rate x horizon.
+    assert light == pytest.approx(PROFILE_ARRIVAL_RATES["light"] * horizon, rel=0.05)
+    assert heavy == pytest.approx(PROFILE_ARRIVAL_RATES["heavy"] * horizon, rel=0.05)
     assert heavy > light
+
+
+@pytest.mark.parametrize(
+    "profile, low, high", [("light", 0.40, 0.50), ("medium", 0.65, 0.75), ("heavy", 0.85, 0.95)]
+)
+def test_profiles_hit_their_target_cpu_load_bands(profile, low, high):
+    cpu_load, _ = expected_offered_load(profile_config(profile, seed=0, horizon=1))
+
+    assert low <= cpu_load <= high
 
 
 # --- Job properties --------------------------------------------------------
@@ -268,7 +278,7 @@ def test_simulating_one_copy_does_not_affect_another_copy_or_the_specs():
         servers=[Server(id=i, cpu_capacity=100.0, memory_capacity=64.0) for i in range(1, 6)]
     )
 
-    metrics = Simulator(cluster, FirstFitScheduler(), simulated).run(max_timesteps=10_000)
+    metrics = Simulator(cluster, FCFSScheduler(), simulated).run(max_timesteps=10_000)
 
     assert metrics.completed_count == len(specs)
     assert all(job.status == JobStatus.COMPLETED for job in simulated)
@@ -277,3 +287,57 @@ def test_simulating_one_copy_does_not_affect_another_copy_or_the_specs():
     assert all(job.remaining_time == job.duration for job in untouched)
     assert specs == specs_before
     assert instantiate_jobs(specs)[0].status == JobStatus.QUEUED
+
+
+# --- Workload validation against the configured cluster -------------------
+
+
+def reference_servers(count: int = 5) -> list[Server]:
+    return [Server(id=i, cpu_capacity=100.0, memory_capacity=64.0) for i in range(1, count + 1)]
+
+
+def spec(job_id=1, arrival_time=0, duration=3, cpu=10.0, memory=4.0) -> JobSpec:
+    return JobSpec(id=job_id, arrival_time=arrival_time, duration=duration,
+                   cpu_required=cpu, memory_required=memory)
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILE_ARRIVAL_RATES))
+def test_generated_profiles_pass_validation(profile):
+    specs = generate_workload(profile_config(profile, seed=3, horizon=300))
+
+    validate_workload(specs, reference_servers())
+
+
+def test_deterministic_workload_passes_validation():
+    validate_workload(DETERMINISTIC_WORKLOAD, reference_servers(3))
+
+
+def test_empty_workload_passes_validation():
+    validate_workload((), reference_servers())
+
+
+@pytest.mark.parametrize(
+    "specs, message",
+    [
+        ((spec(job_id=1), spec(job_id=1)), "unique"),
+        ((spec(job_id=1, arrival_time=5), spec(job_id=2, arrival_time=2)), "arrival order"),
+        ((spec(cpu=0.0),), "> 0"),
+        ((spec(memory=float("nan")),), "finite"),
+        ((spec(cpu=150.0),), "do not fit"),
+        ((spec(memory=80.0),), "do not fit"),
+    ],
+)
+def test_invalid_workloads_are_rejected(specs, message):
+    with pytest.raises(ValueError, match=message):
+        validate_workload(specs, reference_servers())
+
+
+def test_fit_check_uses_the_configured_servers_not_a_fixed_reference():
+    small_cluster = [Server(id=1, cpu_capacity=50.0, memory_capacity=16.0)]
+    big_cluster = [Server(id=1, cpu_capacity=50.0, memory_capacity=16.0),
+                   Server(id=2, cpu_capacity=100.0, memory_capacity=64.0)]
+    job = (spec(cpu=80.0, memory=8.0),)
+
+    with pytest.raises(ValueError, match=r"\[1\]"):
+        validate_workload(job, small_cluster)
+    validate_workload(job, big_cluster)

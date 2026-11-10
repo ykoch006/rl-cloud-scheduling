@@ -6,6 +6,9 @@
     python main.py --workload medium --seed 42 --timesteps 1000
         Generate a stochastic workload and summarise it. This only generates
         the workload; it does not simulate it.
+
+    python main.py --workload medium --seed 1 2 --timesteps 200
+        Generate the same profile with two seeds and compare them side by side.
 """
 
 import argparse
@@ -14,7 +17,7 @@ from statistics import fmean
 from env.cluster import Cluster
 from env.server import Server
 from env.simulator import SimulationMetrics, Simulator
-from env.workload import build_deterministic_workload
+from env.workload import build_deterministic_workload, validate_workload
 from env.workload_generator import (
     PROFILE_ARRIVAL_RATES,
     REFERENCE_SERVER_COUNT,
@@ -25,7 +28,7 @@ from env.workload_generator import (
     observed_offered_load,
     profile_config,
 )
-from schedulers.first_fit import FirstFitScheduler
+from schedulers.fcfs import FCFSScheduler
 
 
 def build_cluster() -> Cluster:
@@ -55,7 +58,7 @@ def print_summary(metrics: SimulationMetrics, total_jobs: int, scheduler_name: s
 
 def run_deterministic_demo() -> None:
     jobs = build_deterministic_workload()
-    scheduler = FirstFitScheduler()
+    scheduler = FCFSScheduler()
     simulator = Simulator(build_cluster(), scheduler, jobs)
 
     metrics = simulator.run()
@@ -109,11 +112,59 @@ def print_workload_summary(profile: str, seed: int, horizon: int) -> None:
         print(f"  Expected RAM load: {expected_memory:.3f}")
 
 
+def reference_servers() -> list[Server]:
+    return [
+        Server(id=i, cpu_capacity=REFERENCE_SERVER_CPU, memory_capacity=REFERENCE_SERVER_MEMORY)
+        for i in range(1, REFERENCE_SERVER_COUNT + 1)
+    ]
+
+
+def print_seed_comparison(profile: str, seeds: list[int], horizon: int) -> None:
+    """Same profile, different seeds: same expected values, different sampled jobs."""
+    if horizon <= 0:
+        raise ValueError("horizon must be > 0 to compare seeds")
+    rows = []
+    for seed in seeds:
+        specs = generate_workload(profile_config(profile, seed, horizon))
+        validate_workload(specs, reference_servers())
+        cpu_load, memory_load = observed_offered_load(specs, horizon)
+        rows.append((seed, specs, cpu_load, memory_load))
+
+    print(f"Workload profile: {profile}, arrival horizon: {horizon} timesteps")
+    print(f"{'seed':>6} {'jobs':>6} {'mean CPU':>9} {'mean RAM':>9} {'mean dur':>9} "
+          f"{'CPU load':>9} {'RAM load':>9}")
+    for seed, specs, cpu_load, memory_load in rows:
+        print(f"{seed:>6} {len(specs):>6} "
+              f"{fmean(s.cpu_required for s in specs):>9.2f} "
+              f"{fmean(s.memory_required for s in specs):>9.2f} "
+              f"{fmean(s.duration for s in specs):>9.2f} "
+              f"{cpu_load:>9.3f} {memory_load:>9.3f}")
+
+    config = profile_config(profile, seeds[0], horizon)
+    expected_cpu, expected_memory = expected_offered_load(config)
+    print(f"{'expect':>6} {config.arrival_rate * horizon:>6.0f} "
+          f"{config.cpu.expected_value():>9.2f} {config.memory.expected_value():>9.2f} "
+          f"{config.duration.expected_value():>9.2f} {expected_cpu:>9.3f} {expected_memory:>9.3f}")
+    print()
+    for seed, specs, _, _ in rows:
+        first = ", ".join(f"(t={s.arrival_time}, dur={s.duration}, cpu={s.cpu_required:.1f})"
+                          for s in specs[:3])
+        print(f"seed {seed} first 3 jobs: {first}")
+    print()
+    print("Every job fits on at least one reference server "
+          f"({REFERENCE_SERVER_COUNT} x {REFERENCE_SERVER_CPU:.0f} CPU / "
+          f"{REFERENCE_SERVER_MEMORY:.0f} GB).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--workload", choices=sorted(PROFILE_ARRIVAL_RATES), help="workload profile")
     parser.add_argument(
-        "--seed", type=int, default=42, help="random seed, used with --workload (default 42)"
+        "--seed",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="random seed(s), used with --workload; give two or more to compare (default 42)",
     )
     parser.add_argument(
         "--timesteps",
@@ -127,7 +178,10 @@ def main() -> None:
         run_deterministic_demo()
         return
     try:
-        print_workload_summary(args.workload, args.seed, args.timesteps)
+        if len(args.seed) == 1:
+            print_workload_summary(args.workload, args.seed[0], args.timesteps)
+        else:
+            print_seed_comparison(args.workload, args.seed, args.timesteps)
     except ValueError as error:
         parser.error(str(error))
 

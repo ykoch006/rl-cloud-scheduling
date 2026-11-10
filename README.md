@@ -8,13 +8,19 @@ heuristics, and under which workload conditions RL gives a real advantage.
 
 ## Current stage
 
-1. **Deterministic simulator.** A small cluster simulator in plain Python
-   with no RL libraries. Jobs arrive, wait in a queue, are placed on
-   servers, hold CPU and memory for their duration, complete, and release
-   their resources. A first-fit scheduler is the first baseline policy.
+1. **Simulator.** A small cluster simulator in plain Python with no RL
+   libraries. Jobs arrive, wait in a queue, are placed on servers, hold CPU
+   and memory for their duration, complete, and release their resources.
 2. **Stochastic workload generator.** Seeded, reproducible workloads with
    Poisson arrivals, log-normal CPU and RAM demands and exponential
    durations. See [Stochastic workloads](#stochastic-workloads).
+3. **Heuristic baselines.** FCFS (with backfilling), SJF, Best-Fit,
+   Round-Robin and Random-valid, all limited to the same five-job candidate
+   window, plus strict FCFS as a reference. See
+   [Scheduling policies](#scheduling-policies).
+
+Not yet implemented: bursty and stress workload profiles, deadlines, energy,
+the Gymnasium environment, RL agents and autoscaling.
 
 ## Architecture
 
@@ -23,57 +29,106 @@ env/
   job.py                 Job: resource demands, duration, lifecycle (queued -> running -> completed)
   server.py              Server: CPU/memory capacity, can_fit / allocate / release, utilisation
   cluster.py             Cluster: servers + queued/running/completed jobs, validates placements
-  workload.py            JobSpec (immutable job description), instantiate_jobs, fixed 10-job workload
+  candidates.py          Shared candidate window: which waiting jobs a scheduler may see
+  workload.py            JobSpec, instantiate_jobs, validate_workload, fixed 10-job workload
   workload_generator.py  WorkloadConfig, distributions, generate_workload, profiles, offered load
   simulator.py           Discrete-timestep loop, Scheduler interface, metrics
 schedulers/
-  first_fit.py           First-fit placement policy
-tests/                   pytest suite for every module
-docs/assumptions.md      Every workload parameter, labelled SOURCE / DERIVED / ASSUMPTION
+  fcfs.py                FCFS with backfilling, and strict FCFS (reference)
+  sjf.py                 Shortest-job-first within the window
+  best_fit.py            Tightest-fitting server
+  round_robin.py         Rotating server choice
+  random_valid.py        Random valid choice (seeded)
+evaluation/
+  runner.py              Runs every policy on identical generated workloads
+tests/                   pytest suite
+docs/MODEL_ASSUMPTIONS.md Time model and every parameter, labelled SOURCE / DERIVED / ASSUMPTION
 main.py                  Deterministic demo, or a stochastic workload summary
 ```
 
 Responsibilities are split so that each class does one thing:
 
-| Component   | Decides                        | Does not                          |
-|-------------|--------------------------------|-----------------------------------|
-| `Scheduler` | which job goes on which server | change any state                  |
-| `Cluster`   | whether a placement is valid   | choose placements                 |
-| `Server`    | whether a job fits right now   | know about queues or time         |
-| `Simulator` | the order of events in time    | know which scheduling policy runs |
+| Component   | Decides                                 | Does not                          |
+|-------------|-----------------------------------------|-----------------------------------|
+| `Scheduler` | which candidate goes on which server    | change any state                  |
+| candidates  | which waiting jobs the scheduler sees   | choose placements                 |
+| `Cluster`   | whether a placement is valid            | choose placements                 |
+| `Server`    | whether a job fits right now            | know about queues or time         |
+| `Simulator` | the order of events in time             | know which scheduling policy runs |
 
 ## How the simulator works
 
-Time moves in discrete steps. At each timestep `t`:
+Time moves in whole ticks. At each tick `t`:
 
 1. Jobs with `arrival_time == t` join the back of the queue.
-2. The scheduler looks at the queue and the servers and proposes
-   `(job, server)` placements.
-3. The cluster applies each proposal if the server has enough free CPU
-   *and* memory, and rejects it otherwise. Rejected jobs stay queued.
-4. Metrics are recorded (queue length, per-server and cluster utilisation).
-5. Every running job advances by one timestep. Jobs that finish are
-   completed at `t + 1` and release their resources, which are then free
-   for the scheduler at the start of the next timestep.
+2. The simulator builds the **candidate window**: the five oldest waiting
+   jobs that fit on at least one server right now. The scheduler picks one
+   `(job, server)` from it, or `None`. If the placement is valid it is
+   applied and the window is rebuilt with the new free capacity; this
+   repeats until the scheduler returns `None` or no candidate fits.
+3. Metrics are recorded (queue length, per-server and cluster utilisation).
+4. Every running job advances by one tick. Jobs that finish are completed at
+   `t + 1` and release their resources, which are free at the start of the
+   next tick.
 
-A job with duration `d` that starts at time `s` completes at exactly
-`s + d`. Resources are reserved for a job's whole duration and jobs are
-never preempted.
+A job with duration `d` that starts at tick `s` completes at exactly `s + d`.
+Resources are reserved for a job's whole duration and jobs are never
+preempted. A scheduler may only choose a job from the window it was shown
+and a server in the cluster; anything else is counted as a rejected
+placement and ends scheduling for that tick.
 
-Any object with a `name` and a
-`schedule(queued_jobs, servers) -> list[(job, server)]` method can be
-passed to the simulator, so new policies plug in without changing the
-simulator.
+A scheduler is any object with a `name`, a `candidate_rule` and a method
+`choose(candidates, servers) -> (job, server) | None`.
 
-### Metrics
+## Scheduling policies
 
-- completed job count
-- average waiting time (time from arrival to start, over completed jobs)
-- queue length at each timestep
-- per-server CPU and memory utilisation at each timestep
-- average cluster CPU and memory utilisation (weighted by capacity)
-- total simulation duration (time at which the last job completes)
-- number of placements the cluster rejected
+All primary policies see the same five-job window (scope §5.2), so none of
+them can use information an RL agent with a five-job observation would not
+have. "Oldest" means queue order, which is arrival time then job id.
+
+| Policy | Job | Server | Ties |
+|---|---|---|---|
+| `fcfs-backfill` | oldest candidate | first server with room (first fit) | queue order, server order |
+| `sjf` | shortest duration in the window | first fit | older job |
+| `best-fit` | oldest candidate | least normalised capacity left after placing | earlier server |
+| `round-robin` | oldest candidate | next server with room after the last one used | rotation order |
+| `random-valid` | random candidate | random server with room | own seeded generator |
+| `fcfs-strict` (reference) | head of the queue only | first fit | — |
+
+**Strict FCFS versus backfilling.** The window only contains jobs that fit
+somewhere, so if the oldest job is too big to fit yet, `fcfs-backfill` skips
+it and lets younger jobs use the free space. `fcfs-strict` instead starts
+nothing until the head of the queue fits (head-of-line blocking). Strict FCFS
+needs to see the blocked head, which the primary policies cannot, so it is
+reported separately as a reference rather than as an equal comparison.
+
+**Best-Fit score:** `(free CPU − job CPU) / CPU capacity + (free RAM − job
+RAM) / RAM capacity`. Dividing by capacity puts both resources on a 0–1 scale.
+
+SJF uses each job's true duration as its runtime estimate (perfect
+estimates). All primary policies start a job whenever one fits; none waits
+on purpose.
+
+## Metrics
+
+- completed and unfinished job counts, completion rate
+- average waiting time over completed jobs
+- **censored** average waiting time over every arrived job: a job still
+  queued at the end counts the time it has waited so far, so this is a lower
+  bound on the true average
+- 95th percentile and maximum wait, average turnaround (completion − arrival)
+- queue length at each tick and its average
+- per-server and cluster CPU and memory utilisation (capacity-weighted)
+- total simulated time and number of rejected placements
+
+**Why unfinished jobs matter.** If a run ends before every job finishes,
+the jobs left over are usually the ones that waited longest. Averaging over
+completed jobs only then makes a policy look better than it is. In one
+heavy-load run with no drain period, Random-valid's completed-only average
+wait (1.81 ticks) was lower than FCFS's (1.94), but once unfinished jobs were
+counted the order reversed (2.11 versus 2.03). The comparison runner
+therefore reports both, and gives every policy the same drain period after
+arrivals stop.
 
 ## Setup
 
@@ -101,42 +156,34 @@ length at every step.
 python main.py
 ```
 
-Example output (shortened):
+Runs the fixed 10-job workload with `fcfs-backfill` on three servers and
+prints every event, then a summary ending:
 
 ```
-t=0 Job 1 arrived
-t=0 Job 1 assigned to Server 1
-...
-t=1 Waiting in queue: jobs 5
-...
-t=3 Job 2 completed on Server 2
-t=3 Job 5 assigned to Server 2
-...
-=== Summary (first-fit) ===
+=== Summary (fcfs-backfill) ===
 Completed jobs:           10/10
 Total simulation time:    8 timesteps
 Average waiting time:     0.60 timesteps
 Queue length over time:   [0, 1, 2, 2, 1, 0, 0, 0]
-Average cluster CPU:      69.6%
-Average cluster memory:   45.4%
 ```
 
 ## Stochastic workloads
 
 ### Model
 
-A workload is generated in two steps.
+The time model is described in
+[docs/MODEL_ASSUMPTIONS.md](docs/MODEL_ASSUMPTIONS.md#time-model). In short,
+the arrival rate λ is the expected number of new jobs per tick.
 
-**Arrivals.** At each integer timestep `t` from `0` to `horizon - 1`, the
-number of arriving jobs is
+**Arrivals.** At each tick `t` from `0` to `horizon - 1`, the number of
+arriving jobs is
 
-    N_t ~ Poisson(lambda_t)
+    N_t ~ Poisson(lambda)
 
-so a timestep can have zero, one or several arrivals. No job arrives at or
-after `horizon`. Jobs are numbered 1, 2, 3, ... in arrival order; jobs that
-arrive in the same timestep keep their generation order. The rate is
+so a tick can have zero, one or several arrivals. No job arrives at or after
+`horizon`. Jobs are numbered 1, 2, 3, ... in arrival order. The rate is
 constant for now. `WorkloadConfig.arrival_rates()` returns one rate per
-timestep, so a time-varying `lambda(t)` only needs a change there.
+tick, so a time-varying rate only needs a change there.
 
 **Job properties.** Each job independently gets:
 
@@ -144,25 +191,26 @@ timestep, so a time-varying `lambda(t)` only needs a change there.
 |---|---|---|
 | CPU demand | log-normal, median 10 units, sigma 0.8 | 1 to 100 units |
 | RAM demand | log-normal, median 4 GB, sigma 0.9 | 0.25 to 64 GB |
-| Duration | `ceil(Exponential(mean 10))` | 1 to 100 timesteps |
+| Duration | `ceil(Exponential(mean 10))` | 1 to 100 ticks |
 
 Values outside the bounds are **redrawn** (rejection sampling), not clipped,
-so no artificial spike of jobs appears at the maximum. Upper bounds equal one
-server's capacity, so every generated job fits on an empty server.
-Rounding durations up makes every duration at least one timestep; the
-resulting mean is about 10.5. These parameters are provisional; see
-[docs/assumptions.md](docs/assumptions.md).
+so no artificial spike of jobs appears at the maximum. Rounding durations up
+makes every duration at least one tick; the resulting mean is about 10.5.
+
+`validate_workload(specs, servers)` checks any workload (generated, fixed or
+loaded later from a trace) against the servers it will run on: unique ids,
+arrival order, finite positive demands and durations, and that every job
+fits on at least one server when that server is empty.
 
 ### Reproducibility
 
 - All randomness comes from `numpy.random.default_rng(seed)`; there is no
   global random state.
-- Arrivals, CPU, RAM and durations each use their own child stream
-  spawned from that seed. Changing one distribution does not change the
-  values drawn for the others.
+- Arrivals, CPU, RAM and durations each use their own child stream spawned
+  from that seed, so changing one distribution does not change the others.
 - The same `WorkloadConfig` always produces exactly the same workload.
 - `generate_workload` returns immutable `JobSpec`s. The simulator changes
-  `Job` objects as it runs, so every run should get **fresh** jobs:
+  `Job` objects as it runs, so every run gets **fresh** jobs:
 
 ```python
 from env.workload import instantiate_jobs
@@ -173,44 +221,59 @@ jobs_for_run_a = instantiate_jobs(specs)   # independent copies of the
 jobs_for_run_b = instantiate_jobs(specs)   # same arrivals and demands
 ```
 
-### Configuration
+### Profiles
 
-A workload is fully described by one frozen `WorkloadConfig` dataclass:
-`seed`, `horizon`, `arrival_rate`, and the `cpu`, `memory` and `duration`
-distributions (each with its own bounds). Invalid values raise a
-`ValueError` that names the parameter. Examples include a negative rate,
-a non-integer horizon, or bounds above server capacity.
+A workload is fully described by one frozen `WorkloadConfig`: `seed`,
+`horizon`, `arrival_rate`, and the `cpu`, `memory` and `duration`
+distributions. Invalid values raise a `ValueError` naming the parameter.
 
-Three development profiles differ only in arrival rate:
-
-| Profile | Jobs per timestep | Expected CPU load* | Expected RAM load* |
-|---|---|---|---|
-| light | 1.0 | 0.29 | 0.19 |
-| medium | 2.0 | 0.57 | 0.39 |
-| heavy | 3.0 | 0.86 | 0.58 |
+| Profile | Jobs per tick | Expected CPU load* | Expected RAM load* | Target band |
+|---|---|---|---|---|
+| light | 1.6 | 0.456 | 0.311 | 40–50% |
+| medium | 2.5 | 0.712 | 0.486 | 65–75% |
+| heavy | 3.2 | 0.912 | 0.622 | 85–95% |
 
 \* On 5 reference servers. Offered load = arrival rate × E[demand ×
-duration] / total cluster capacity. These are **not** calibrated workload
-levels.
+duration] / total cluster capacity. The target bands are development
+targets, not measured cloud workload levels.
 
-### Summarising a workload
+### Inspecting workloads
 
 ```bash
 python main.py --workload medium --seed 42 --timesteps 1000
 ```
 
-This prints the job count, the observed mean demands and durations next to
-their theoretical values, the first 10 arrivals, and the observed and
-expected offered load. It only generates the workload; it does not run the
-simulator.
+Summarises one workload: job count, observed means next to theoretical
+values, the first 10 arrivals and the offered load. Generation only; nothing
+is simulated.
 
-### Provisional and not yet implemented
+```bash
+python main.py --workload medium --seed 1 2 --timesteps 200
+```
 
-- All numerical parameters are development assumptions, to be calibrated
+Compares two seeds of the same profile side by side. Over 200 ticks the
+observed CPU load was 0.608 for seed 1 and 0.758 for seed 2 against an
+expected 0.712, which is why results should be averaged over many seeds.
+
+## Comparing policies
+
+```bash
+python -m evaluation.runner --workload heavy --seeds 0 1 2 3 4 --timesteps 500 --drain 500
+```
+
+For each seed, the workload is generated once and validated, then every
+policy runs on its own fresh copy of the jobs, a fresh cluster and a fresh
+scheduler, with the same arrival horizon and maximum drain period.
+Utilisation is averaged over the arrival horizon only, so a policy is not
+penalised just for running longer. The table shows the mean over seeds;
+paired per-seed comparisons with confidence intervals are planned.
+
+## Provisional and not yet implemented
+
+- All workload parameters are development assumptions, to be calibrated
   later, including against the Alibaba cluster trace.
-- Bursty / time-varying arrival rates (planned next).
-- SLA deadlines, energy costs, correlated CPU/RAM demands.
-- Running generated workloads through the simulator in experiments.
-  `Simulator.run` stops at `max_timesteps` (default 1000) without a warning,
-  so a run with a 1000-step arrival horizon must use a larger limit or it
-  will leave jobs unfinished.
+- Bursty and stress profiles.
+- Deadlines, energy, correlated CPU/RAM demands.
+- Starvation checks for large jobs under the feasible-only window (scheduled
+  with the Gymnasium work).
+- Paired statistical analysis of policy comparisons.
