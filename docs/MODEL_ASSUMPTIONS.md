@@ -1,6 +1,6 @@
 # Model assumptions: workloads and scheduling
 
-Status as of 10 November 2026. These are **provisional development settings**.
+Status as of 11 November 2026. These are **provisional development settings**.
 They have not been calibrated against Google, AWS, Alibaba or any other
 production trace, and must not be presented as representative of real cloud
 workloads. Calibration (including Alibaba trace-informed validation) is a
@@ -83,10 +83,9 @@ bottleneck resource in all three profiles. Even "heavy" is below 1.0
 nominal load, although fragmentation across servers means queueing can
 appear well before that.
 
-These are expectations. A single short workload can differ noticeably:
-with a 200-tick horizon, medium gave an observed CPU load of 0.608 for seed 1
-and 0.758 for seed 2, because CPU × duration has a heavy right tail. Results
-should therefore be averaged over many seeds.
+These are expectations. A single short workload can differ noticeably from
+them because CPU × duration has a heavy right tail; see
+[RESULTS.md](RESULTS.md#seed-to-seed-variation-in-short-workloads).
 
 ### Bursty profile
 
@@ -111,23 +110,14 @@ relative to capacity and can exceed 1, as it does during bursts. Measured
 utilisation is the fraction of capacity actually reserved and can never
 exceed 1. Demand above capacity waits in the queue and is served later.
 
-In the policy comparisons, utilisation is measured over the arrival horizon
-only (ticks 0 to T−1); drain ticks are excluded. Over seeds 0–9 with
-T = 1,000, FCFS-backfill's measured CPU utilisation was 68.85% (bursty) and
-69.82% (medium), below the expected 71.2%. Two measured effects account for
-this:
-
-1. **These seeds' realised offered load was lower than expected:** 0.705
-   (bursty) and 0.706 (medium) on average, rather than 0.712.
-2. **Some work finishes after the horizon:** 2.3% (bursty) and 1.1%
-   (medium) of all reserved CPU-time fell in the drain period, so it is not
-   counted in the horizon window.
-
-Utilisation over the horizon equals realised offered load × (1 − share of
-work in the drain): 0.705 × (1 − 0.023) ≈ 0.689 for bursty, matching the
-measured 68.85%. Over the whole run including drain, the same runs averaged
-67.34% (bursty) and 68.07% (medium), lower again because the drain ticks are
-mostly idle.
+When every job eventually completes, utilisation measured over the arrival
+horizon equals the realised offered load × (1 − the share of reserved
+CPU-time that falls after the horizon). It is therefore below the expected
+offered load whenever a sample generates less work than expected or some work
+is finished during the drain. Measured values are in
+[RESULTS.md](RESULTS.md#measured-utilisation-versus-offered-load); the
+measurement window is defined in
+[EXPERIMENT_PROTOCOL.md](EXPERIMENT_PROTOCOL.md#measurement-windows).
 
 Not yet implemented from the scope: the stress profile.
 
