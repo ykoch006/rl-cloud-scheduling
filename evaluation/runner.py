@@ -15,7 +15,8 @@ from statistics import fmean
 
 from env.cluster import Cluster
 from env.server import Server
-from env.simulator import Scheduler, SimulationMetrics, Simulator
+from env.validation import is_integer
+from env.simulator import SLA_SLOWDOWN, Scheduler, SimulationMetrics, Simulator
 from env.workload import JobSpec, instantiate_jobs, validate_workload
 from env.workload_generator import (
     PROFILES,
@@ -68,6 +69,9 @@ def run_policy(
     specs: Sequence[JobSpec], scheduler: Scheduler, horizon: int, drain: int,
     server_count: int = REFERENCE_SERVER_COUNT,
 ) -> SimulationMetrics:
+    for name, value in (("horizon", horizon), ("drain", drain)):
+        if not is_integer(value) or value < 0:
+            raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
     cluster = Cluster(servers=reference_servers(server_count))
     simulator = Simulator(cluster, scheduler, instantiate_jobs(specs))
     return simulator.run(max_timesteps=horizon + drain)
@@ -97,29 +101,36 @@ def _mean(values: list[float | None]) -> float:
     return fmean(present) if present else float("nan")
 
 
-def summarise(results: list[RunResult], horizon: int) -> list[dict]:
+def summarise(
+    results: list[RunResult], horizon: int, sla_slowdown: float = SLA_SLOWDOWN
+) -> list[dict]:
     """One row per policy: each metric is computed per seed, then averaged.
 
-    Every seed counts equally, whatever its job count. So "p95 wait" is the
+    Every seed counts equally, whatever its job count. So "p95 wait LB" is the
     mean of the per-seed 95th percentiles, not the 95th percentile of all jobs
     pooled together, and "wait (done)" is the mean of per-seed means. A seed
-    with no completed jobs has no wait value and is left out of those columns.
-    Queue length and utilisation use ticks 0..horizon-1 only; drain ticks are
-    excluded. This is a first descriptive summary; paired per-seed comparisons
-    with confidence intervals are planned separately.
+    with no value for a column (for example no completed jobs) is left out of
+    that column. Job metrics follow every job until the run ends, including
+    the drain; queue length and utilisation use ticks 0..horizon-1 only. This
+    is a first descriptive summary; paired per-seed comparisons with
+    confidence intervals are planned separately.
     """
     rows = []
     for policy in dict.fromkeys(r.policy for r in results):
         runs = [r.metrics for r in results if r.policy == policy]
         utilisation = [m.average_utilisation_over(horizon) for m in runs]
+        sla = [m.sla(sla_slowdown) for m in runs]
         rows.append({
             "policy": policy,
             "completed %": 100 * _mean([m.completion_rate for m in runs]),
             "unfinished": _mean([m.unfinished_count for m in runs]),
             "wait (done)": _mean([m.average_waiting_time for m in runs]),
-            "wait (all)": _mean([m.censored_average_waiting_time for m in runs]),
-            "p95 wait": _mean([m.p95_waiting_time for m in runs]),
-            "turnaround": _mean([m.average_turnaround_time for m in runs]),
+            "wait LB": _mean([m.censored_average_waiting_time for m in runs]),
+            "p95 wait LB": _mean([m.censored_p95_waiting_time for m in runs]),
+            "turnaround LB": _mean([m.censored_average_turnaround_time for m in runs]),
+            "SLA viol %": 100 * _mean([s.violation_rate for s in sla]),
+            "SLA unknown %": 100 * _mean([s.unknown_rate for s in sla]),
+            "lateness": _mean([s.mean_lateness for s in sla]),
             "queue": _mean([m.average_queue_length_over(horizon) for m in runs]),
             "CPU %": 100 * _mean([cpu for cpu, _ in utilisation]),
             "RAM %": 100 * _mean([memory for _, memory in utilisation]),
@@ -172,26 +183,34 @@ def main() -> None:
     parser.add_argument("--timesteps", type=int, default=500, help="arrival horizon (default 500)")
     parser.add_argument("--drain", type=int, default=DEFAULT_DRAIN,
                         help=f"extra ticks allowed after arrivals stop (default {DEFAULT_DRAIN})")
+    parser.add_argument("--sla-slowdown", type=float, default=SLA_SLOWDOWN,
+                        help=f"SLA deadline = arrival + k x duration (default k={SLA_SLOWDOWN})")
     args = parser.parse_args()
     if args.timesteps <= 0 or args.drain < 0:
         parser.error("--timesteps must be > 0 and --drain must be >= 0")
+    if not 1 <= args.sla_slowdown < float("inf"):
+        parser.error("--sla-slowdown must be a finite number >= 1")
 
     print(f"Profile {args.workload}, seeds {args.seeds}, arrival horizon {args.timesteps}, "
           f"max drain {args.drain}, {REFERENCE_SERVER_COUNT} servers x "
           f"{REFERENCE_SERVER_CPU:.0f} CPU / {REFERENCE_SERVER_MEMORY:.0f} GB")
     print("Each value is computed per seed, then averaged over seeds (seeds weighted equally).")
-    print("'wait (done)', 'p95 wait' and 'turnaround' use completed jobs only; 'wait (all)' also")
-    print("counts unfinished jobs' waits so far (a lower bound). 'queue', 'CPU %' and 'RAM %'")
-    print(f"are averaged over ticks 0-{args.timesteps - 1} (the arrival horizon); drain ticks are excluded.")
+    print("'wait (done)' uses completed jobs only. The 'LB' columns, SLA and lateness also count")
+    print("unfinished jobs' times so far, so they are lower bounds while any job is unfinished.")
+    print(f"SLA deadline = arrival + {args.sla_slowdown:g} x duration. 'SLA viol %' (confirmed")
+    print("violations) and 'SLA unknown %' (unfinished jobs that could still be on time) are")
+    print("percentages of all jobs in the workload; 'lateness' is mean ticks late per job.")
+    print("'queue', 'CPU %' and 'RAM %' are averaged over ticks")
+    print(f"0-{args.timesteps - 1} (the arrival horizon); drain ticks are excluded.")
     print()
     primary = compare_policies(args.workload, args.seeds, args.timesteps, args.drain)
     reference = compare_policies(args.workload, args.seeds, args.timesteps, args.drain,
                                  REFERENCE_POLICIES)
     print("Primary policies (shared five-job feasible window):")
-    print_table(summarise(primary, args.timesteps))
+    print_table(summarise(primary, args.timesteps, args.sla_slowdown))
     print()
     print("Reference policy (sees the blocked head of the queue):")
-    print_table(summarise(reference, args.timesteps))
+    print_table(summarise(reference, args.timesteps, args.sla_slowdown))
 
     config = profile_config(args.workload, args.seeds[0], args.timesteps)
     if config.burst is not None and args.timesteps >= config.burst.period:

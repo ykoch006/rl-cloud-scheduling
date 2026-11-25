@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from env.candidates import CandidateRule
@@ -117,6 +118,32 @@ def test_job_too_large_for_any_server_stops_at_max_timesteps():
     assert metrics.completed_count == 0
     assert metrics.average_waiting_time is None
     assert simulator.cluster.queued_jobs == [huge]
+
+
+@pytest.mark.parametrize("limit", [-1, 2.5, True, float("nan"), float("inf"), np.bool_(True)])
+def test_invalid_max_timesteps_is_rejected(limit):
+    simulator = Simulator(make_cluster(), FCFSScheduler(), build_deterministic_workload())
+
+    with pytest.raises(ValueError, match="max_timesteps"):
+        simulator.run(max_timesteps=limit)
+
+
+def test_zero_max_timesteps_runs_no_steps():
+    jobs = build_deterministic_workload()
+
+    metrics = Simulator(make_cluster(), FCFSScheduler(), jobs).run(max_timesteps=0)
+
+    assert metrics.total_duration == 0
+    assert metrics.unfinished_count == len(jobs)
+
+
+def test_numpy_integer_max_timesteps_is_accepted():
+    _, expected, _ = run_demo()
+    simulator = Simulator(make_cluster(), FCFSScheduler(), build_deterministic_workload())
+
+    metrics = simulator.run(max_timesteps=np.int64(1000))
+
+    assert metrics.total_duration == expected.total_duration == 8
 
 
 class OverloadingScheduler:

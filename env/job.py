@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
+from env.validation import is_finite_number, is_integer
+
 
 class JobStatus(Enum):
     """Lifecycle state of a job: queued -> running -> completed."""
@@ -37,12 +39,17 @@ class Job:
     status: JobStatus = field(default=JobStatus.QUEUED, init=False)
 
     def __post_init__(self) -> None:
-        if self.arrival_time < 0:
-            raise ValueError(f"Job {self.id}: arrival_time must be >= 0")
-        if self.duration < 1:
-            raise ValueError(f"Job {self.id}: duration must be >= 1")
-        if self.cpu_required < 0 or self.memory_required < 0:
-            raise ValueError(f"Job {self.id}: resource requirements must be >= 0")
+        if not is_integer(self.id):
+            raise ValueError(f"Job id must be an integer, got {self.id!r}")
+        if not is_integer(self.arrival_time) or self.arrival_time < 0:
+            raise ValueError(f"Job {self.id}: arrival_time must be an integer >= 0")
+        if not is_integer(self.duration) or self.duration < 1:
+            raise ValueError(f"Job {self.id}: duration must be an integer >= 1")
+        demands = (self.cpu_required, self.memory_required)
+        if not all(is_finite_number(d) and d >= 0 for d in demands):
+            raise ValueError(f"Job {self.id}: resource requirements must be finite and >= 0")
+        if self.cpu_required == 0 and self.memory_required == 0:
+            raise ValueError(f"Job {self.id}: CPU and RAM demands cannot both be 0")
         self.remaining_time = self.duration
 
     def start(self, current_time: int, server_id: int) -> None:

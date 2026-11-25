@@ -22,10 +22,13 @@ Implemented:
   and Random-valid, all limited to the same five-job candidate window, plus
   strict FCFS as a reference policy.
 - **Comparison runner.** Runs every policy on identical workloads and reports
-  waiting time, unfinished jobs, queue length and utilisation.
+  waiting time, turnaround, unfinished jobs, SLA violations and lateness
+  (evaluation-only deadlines of arrival + 3 × duration), queue length and
+  utilisation.
 
-Not yet implemented: the stress workload profile, deadlines, energy, the
-Gymnasium environment, RL agents (Q-learning, DQN, PPO) and autoscaling.
+Not yet implemented: the stress workload profile, an energy model (not
+informative with always-on servers; see the protocol), the Gymnasium
+environment, RL agents (Q-learning, DQN, PPO) and autoscaling.
 
 ## Documentation
 
@@ -109,7 +112,8 @@ python -m evaluation.runner --workload bursty --seeds 0 1 2 3 4 5 6 7 8 9 --time
 
 Each column is computed per seed and then averaged over seeds. Queue length
 and utilisation cover the arrival horizon only, and unfinished jobs are
-reported next to the waiting times. For bursty workloads the runner also
+reported next to the waiting times. `--sla-slowdown` changes the SLA
+deadline factor (default 3). For bursty workloads the runner also
 prints the mean queue length across the burst cycle. Column definitions are
 in [docs/EXPERIMENT_PROTOCOL.md](docs/EXPERIMENT_PROTOCOL.md).
 
@@ -132,8 +136,9 @@ completion time.
   Alibaba cluster trace, is planned.
 - Results are descriptive means over a few seeds. Paired statistical
   comparisons have not been carried out yet.
-- Possible starvation of large jobs under the feasible-only candidate window
-  has not been measured.
+- Large-CPU jobs can be starved under heavy load (waits over 500 ticks); see
+  docs/RESULTS.md.
 - CPU and RAM demands are sampled independently, and SJF assumes it knows
   each job's exact duration.
-- Deadlines, energy and the stress profile are not implemented.
+- SLA deadlines are a modelling assumption (k = 3) used for evaluation only;
+  energy and the stress profile are not implemented.

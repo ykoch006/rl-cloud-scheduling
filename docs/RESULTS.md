@@ -1,7 +1,8 @@
 # Results so far
 
 All results below were reproduced on 11 November 2026 at commit `36776b4`
-with the commands shown. They are descriptive means over a small number of
+with the commands shown, except the SLA and long-wait sections, which were
+produced on 25 November 2026 from a working tree based on commit `fa85584`. They are descriptive means over a small number of
 seeds and have not been tested statistically. Metric definitions,
 measurement windows and the aggregation over seeds are in
 [EXPERIMENT_PROTOCOL.md](EXPERIMENT_PROTOCOL.md). All workloads use the
@@ -32,9 +33,10 @@ python -m evaluation.runner --workload heavy --seeds 0 1 2 3 4 --timesteps 500 -
 ```
 
 With no drain period, runs stop as soon as arrivals end and some jobs are left
-unfinished (primary policies):
+unfinished (primary policies). The p95 column here is over completed jobs
+only; the runner now reports a censored p95 over all arrived jobs instead.
 
-| Policy | Completed % | Unfinished | Wait (done) | Wait (all) | p95 wait |
+| Policy | Completed % | Unfinished | Wait (done) | Wait LB | p95 (done) |
 |---|---|---|---|---|---|
 | fcfs-backfill | 97.73 | 36.2 | 1.94 | 2.03 | 8.00 |
 | sjf | 97.79 | 35.2 | 1.62 | 1.80 | 6.80 |
@@ -55,7 +57,7 @@ python -m evaluation.runner --workload bursty --seeds 0 1 2 3 4 5 6 7 8 9 --time
 python -m evaluation.runner --workload medium --seeds 0 1 2 3 4 5 6 7 8 9 --timesteps 1000 --drain 500
 ```
 
-Every job completed in every run, so "wait (done)" equals "wait (all)". All
+Every job completed in every run, so "wait (done)" equals "wait LB". All
 values are means over the 10 seeds of per-seed values; waits are in ticks.
 
 | Policy | Bursty wait | Bursty p95 | Bursty queue | Medium wait | Medium p95 | Medium queue |
@@ -141,10 +143,75 @@ The per-seed, pooled and drain-share figures in the last two sections come
 from a short analysis script run outside the repository against these
 results; they are not printed by the runner.
 
+## SLA violations
+
+```bash
+python -m evaluation.runner --workload light --seeds 0 1 2 3 4 5 6 7 8 9 --timesteps 1000 --drain 500
+```
+
+The same command was run for medium, heavy and bursty, with the default SLA
+deadline of arrival + 3 × duration. Every job completed in every run, so
+"SLA unknown %" was 0.00 throughout and the values below are exact, not lower
+bounds. "Viol %" is the percentage of all jobs that completed after their
+deadline; "lateness" is mean ticks late per job, with on-time jobs counted as
+0. Light-load lateness was at most 0.02 ticks for every policy.
+
+| Policy | Light viol % | Medium viol % | Medium lateness | Heavy viol % | Heavy lateness | Bursty viol % | Bursty lateness |
+|---|---|---|---|---|---|---|---|
+| fcfs-backfill | 0.01 | 0.52 | 0.05 | 6.19 | 0.83 | 3.07 | 0.20 |
+| sjf | 0.02 | 0.36 | 0.04 | 2.45 | 0.87 | 1.15 | 0.09 |
+| best-fit | 0.02 | 0.53 | 0.04 | 5.93 | 0.86 | 2.97 | 0.19 |
+| round-robin | 0.07 | 0.71 | 0.13 | 6.21 | 0.99 | 2.98 | 0.25 |
+| random-valid | 0.04 | 0.77 | 0.15 | 5.25 | 1.61 | 2.82 | 0.31 |
+| fcfs-strict (reference) | 0.03 | 3.49 | 0.16 | 58.58 | 20.48 | 11.62 | 0.72 |
+
+Light load hardly separates the policies. Under heavy load SJF had far fewer
+violations than the other primary policies but not the lowest lateness,
+because it delays long jobs (next section). Random-valid had the highest
+lateness of the primary policies under every non-light profile.
+
+With no drain period (`--workload heavy --seeds 0 1 2 3 4 --timesteps 500
+--drain 0`), 2.09–2.12% of jobs were SLA unknown for the primary policies, so
+their violation rates of 3.33–6.34% are lower bounds and the true rates are
+at most about 2.1 percentage points higher.
+
+## Long waits under heavy load
+
+Under heavy load (seeds 0–9, T = 1,000, drain 500) a few jobs waited
+hundreds of ticks. A script outside the repository observed these runs
+without changing the policies. At every placement it recorded whether a
+younger job was placed while an older queued job fitted on some server
+(bypassing). At the end of every tick it recorded why each queued job did
+not fit: no single server had room although the cluster's total free CPU and
+RAM would have been enough (fragmentation), or the total free capacity was
+too small (contention).
+
+| Policy | Jobs waiting ≥ 100 ticks (of 31,794) | Max wait | Their median CPU demand | Bypassed while fitting | Waiting ticks: contention / fragmentation |
+|---|---|---|---|---|---|
+| fcfs-backfill | 52 | 553 | 82.2 | 0% | 88% / 12% |
+| sjf | 108 | 795 | 76.5 | 80% (22 times on average) | 77% / 23% |
+| best-fit | 69 | 550 | 79.5 | 0% | 83% / 17% |
+| round-robin | 70 | 517 | 82.6 | 0% | 81% / 19% |
+| random-valid | 141 | 865 | 76.7 | 83% (4 times on average) | 82% / 18% |
+
+The long waits fall on jobs that need a large share of one server's CPU: their
+median demand was 77–83 units, compared with 10 for all jobs (99th
+percentile 59.5). Under FCFS-backfill, Best-Fit and Round-Robin these jobs
+were never passed over while they fitted, and the five-job window was never
+the reason they were left out. They waited because no server had enough free
+CPU at any decision, mostly because total free capacity was too small. This
+is consistent with backfilling without reservation: all primary policies are
+work-conserving, so capacity freed on a server is filled at once by smaller
+jobs that do fit, and a server rarely accumulates the 80 or so free units a
+large job needs. SJF and Random-valid add direct bypassing: most of their
+long-wait jobs were in the window and fitted at some point, but a shorter or
+randomly chosen job was taken instead. Strict FCFS, which never lets a
+younger job start first, had a maximum wait of only 122 ticks, but 1,459 jobs
+waited at least 100 ticks.
+
 ## Limitations
 
 - Ten seeds at most, and no confidence intervals or paired tests yet.
 - One burst shape; other periods or intensities may behave differently.
 - Provisional, uncalibrated workload parameters.
-- No deadlines or energy, so the results cover waiting time, queueing and
-  utilisation only.
+- SLA results use one deadline factor (k = 3); there is no energy model.

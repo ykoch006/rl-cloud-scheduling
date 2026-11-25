@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 from env.job import Job
+from env.validation import is_finite_number, is_integer
 
 
 @dataclass
@@ -23,8 +24,11 @@ class Server:
     running_jobs: list[Job] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        if self.cpu_capacity <= 0 or self.memory_capacity <= 0:
-            raise ValueError(f"Server {self.id}: capacities must be > 0")
+        if not is_integer(self.id):
+            raise ValueError(f"Server id must be an integer, got {self.id!r}")
+        for capacity in (self.cpu_capacity, self.memory_capacity):
+            if not is_finite_number(capacity) or capacity <= 0:
+                raise ValueError(f"Server {self.id}: capacities must be finite and > 0")
         self.available_cpu = self.cpu_capacity
         self.available_memory = self.memory_capacity
 

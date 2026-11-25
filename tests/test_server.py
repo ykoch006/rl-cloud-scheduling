@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from env.job import Job
@@ -24,10 +25,30 @@ def test_new_server_has_full_capacity_available():
     assert server.running_jobs == []
 
 
-@pytest.mark.parametrize("overrides", [dict(cpu_capacity=0), dict(memory_capacity=-1)])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(cpu_capacity=0),
+        dict(memory_capacity=-1),
+        dict(cpu_capacity=float("nan")),
+        dict(cpu_capacity=float("inf")),
+        dict(memory_capacity=float("nan")),
+        dict(memory_capacity=True),
+        dict(id=1.5),
+        dict(id=True),
+        dict(id=np.bool_(True)),
+        dict(cpu_capacity=np.float64("inf")),
+    ],
+)
 def test_invalid_capacity_is_rejected(overrides):
     with pytest.raises(ValueError):
         make_server(**overrides)
+
+
+def test_numpy_values_are_accepted():
+    server = make_server(id=np.int64(2), cpu_capacity=np.float64(100.0), memory_capacity=np.int64(64))
+
+    assert server.available_cpu == 100.0
 
 
 def test_can_fit_when_enough_resources():

@@ -43,8 +43,16 @@ the run ended:
   so far. Its true wait is at least this long (right-censored), so the
   censored average is a lower bound on the true average wait.
 
+The p95 wait, turnaround and SLA metrics treat unfinished jobs the same way,
+using each job's earliest possible completion: its completion time if it
+completed; `start + duration` if it is running (jobs are never preempted);
+`run end + duration` if it is queued; `arrival + duration` if it has not
+arrived. A percentile never decreases when a value increases, so the
+censored p95 is also a lower bound. Only "wait (done)" is computed over
+completed jobs alone; it is kept as a diagnostic of exactly this bias.
+
 Jobs that had not arrived when the run ended are unfinished but are not
-included in any waiting-time average.
+included in any waiting-time or turnaround average.
 
 ## Metric definitions
 
@@ -52,24 +60,65 @@ Every column of the comparison table is computed separately for each workload
 seed and then averaged over seeds, with every seed weighted equally regardless
 of how many jobs it contains.
 
-| Column | Per seed | Jobs or ticks included |
-|---|---|---|
-| completed % | completed jobs / all jobs in the workload | all jobs |
-| unfinished | jobs queued, running or not yet arrived when the run stopped | all jobs |
-| wait (done) | mean of `start − arrival` | completed jobs only |
-| wait (all) | censored mean wait, as defined above (a lower bound) | every job that arrived before the run ended |
-| p95 wait | 95th percentile of `start − arrival`, NumPy linear interpolation | completed jobs only |
-| turnaround | mean of `completion − arrival` | completed jobs only |
-| queue | mean queue length, sampled after scheduling each tick | ticks 0 to T−1 only |
-| CPU %, RAM % | mean capacity-weighted cluster utilisation | ticks 0 to T−1 only |
+| Column | Per seed | Unit | Jobs or ticks included |
+|---|---|---|---|
+| completed % | completed jobs / all jobs in the workload | % | all jobs |
+| unfinished | jobs queued, running or not yet arrived when the run stopped | jobs | all jobs |
+| wait (done) | mean of `start − arrival` | ticks | completed jobs only |
+| wait LB | censored mean wait, as defined above (a lower bound) | ticks | every job that arrived before the run ended |
+| p95 wait LB | 95th percentile of the censored waits, NumPy linear interpolation (a lower bound) | ticks | as wait LB |
+| turnaround LB | mean of `earliest completion − arrival`, i.e. censored wait + duration (a lower bound) | ticks | as wait LB |
+| SLA viol % | confirmed SLA violations / all jobs in the workload (below) | % | all jobs |
+| SLA unknown % | unfinished jobs that could still meet their deadline / all jobs in the workload | % | all jobs |
+| lateness | sum of `max(0, earliest completion − deadline)` / all jobs | ticks per job | all jobs |
+| queue | mean queue length, sampled after scheduling each tick | jobs | ticks 0 to T−1 only |
+| CPU %, RAM % | mean capacity-weighted share of capacity reserved by running jobs | % | ticks 0 to T−1 only |
 
-`SimulationMetrics` also records the maximum completed-job wait, per-server
-utilisation, the total simulated time and the number of rejected placements.
+When a seed has nothing to average for a column (no completed jobs for
+"wait (done)", no arrived jobs for the "LB" columns, an empty workload for
+completed %, SLA viol % and lateness), its value is undefined (`None`), not
+0. Utilisation is reserved capacity, not measured hardware usage.
+
+`SimulationMetrics` also records the completed-only p95, maximum wait and
+turnaround, per-server utilisation, the total simulated time and the number
+of rejected placements.
+
+## SLA deadlines
+
+Each job's deadline is `arrival + k × duration`, with slowdown factor k = 3 by
+default (`--sla-slowdown`; k must be finite and ≥ 1, where k = 1 allows no
+waiting). k = 3 is a modelling assumption, not an established SLA threshold;
+k = 2 and k = 5 are planned for sensitivity analysis. Deadlines are
+evaluation-only: schedulers do not see them, and generated workloads are
+unchanged.
+
+- A job is on time if it completes at or before its deadline; completing
+  exactly at the deadline is on time.
+- Lateness is `max(0, completion − deadline)` in ticks, assessed once per job
+  at completion. A penalty of one unit per tick past the deadline would give
+  the same total.
+- "SLA viol %" and "lateness" are reported separately because they can
+  disagree: under heavy load SJF had far fewer violations than FCFS-backfill
+  but no lower mean lateness, because it moves delay from short jobs to long
+  ones.
+- An unfinished job whose earliest possible completion is already after its
+  deadline is a confirmed violation, and its lateness so far is counted. An
+  unfinished job that could still finish on time is counted as unknown and
+  adds no lateness. While any job is unfinished, SLA viol % and lateness are
+  therefore lower bounds, and the true violation rate lies between SLA viol %
+  and SLA viol % + SLA unknown %.
+- Both percentages use the same denominator: every job in the workload,
+  including jobs that were unfinished or had not arrived when the run
+  stopped, so on-time jobs, confirmed violations and unknown jobs together
+  make up 100%.
 
 ## Measurement windows
 
 **Queue length and CPU/RAM utilisation are measured over the arrival horizon
-only, ticks 0 to T−1. Drain ticks are excluded.** Runs end at different times
+only, ticks 0 to T−1. Drain ticks are excluded.** Job metrics (completed %,
+waits, turnaround and SLA) are per job instead: every job arrives in ticks 0
+to T−1 and is followed until it completes or the run stops at T + D, so they
+include the drain. Runs end at different times
 for different policies and the drain period is mostly idle, so a fixed window
 keeps every policy on the same footing. If a run finishes before `T`, the
 remaining ticks count as idle with an empty queue.
@@ -86,15 +135,14 @@ capacity and can exceed 1 (see
 
 Because each column is a mean of per-seed values:
 
-- **"p95 wait" is the mean of the per-seed 95th percentiles,** not the 95th
+- **"p95 wait LB" is the mean of the per-seed 95th percentiles,** not the 95th
   percentile of all jobs pooled together. Waits are whole ticks, so
   fractional values come from interpolation and averaging.
 - **"wait (done)" is the mean of per-seed means,** not a mean over all jobs
   pooled.
-- A seed with no completed jobs has no wait value and is left out of the
-  wait, p95 and turnaround columns while still counting in "completed %".
-  This has not occurred in any reported run, but it would make denominators
-  differ between columns.
+- A seed with an undefined value for a column is left out of that column's
+  mean while still counting in the others. This has not occurred in any
+  reported run, but it would make denominators differ between columns.
 
 [RESULTS.md](RESULTS.md#aggregation-check) compares the per-seed and pooled
 values for one case.
@@ -109,10 +157,25 @@ count as an empty queue. The 0–9 bucket includes the first cycle, which has
 no burst before it. This table shows average behaviour only; individual
 cycles are not examined.
 
+## Metrics considered but not reported
+
+- **Throughput.** Every job arrives before T. Within the arrival horizon,
+  completions by T equal arrivals minus the jobs still queued or running at
+  T; over a complete run they equal the job count. Throughput would
+  therefore repeat completed % and queue length.
+- **Energy.** There is no energy model. With N always-on servers of equal
+  capacity, a linear power model `P = P_idle + (P_max − P_idle) × u` gives an
+  energy over T ticks of `N × T × (P_idle + (P_max − P_idle) × mean u)`, an
+  affine function of the CPU % column. Over a complete run the reserved
+  CPU-time, `sum(cpu × duration)`, is the same for every policy, so only the
+  run length would change the result. An energy figure would add nothing
+  until servers can be switched off or the cluster scales. Any future figure
+  would be an abstract proxy, not measured hardware consumption.
+
 ## Not yet part of the protocol
 
 - Paired per-seed comparisons with bootstrap confidence intervals, as planned
   in the scope. Current tables are descriptive means.
-- Starvation checks and job-size-stratified tail metrics for the
-  feasible-only candidate window.
-- Deadline and energy metrics.
+- Job-size-stratified tail metrics. Long waits of large-CPU jobs under
+  heavy load were analysed once (RESULTS.md) but are not reported by the
+  runner.

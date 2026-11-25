@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from env.validation import is_integer
 from env.workload import JobSpec
 
 # Reference server from the PID: 100 CPU units and 64 GB of RAM.
@@ -124,7 +125,7 @@ class TruncatedExponentialDuration:
     def __post_init__(self) -> None:
         if not math.isfinite(self.mean) or self.mean <= 0:
             raise ValueError(f"mean duration must be a finite number > 0, got {self.mean}")
-        if not isinstance(self.maximum, int) or self.maximum < 1:
+        if not is_integer(self.maximum) or self.maximum < 1:
             raise ValueError(f"maximum duration must be an integer >= 1, got {self.maximum}")
         if self.acceptance_probability() < MIN_ACCEPTANCE_PROBABILITY:
             raise ValueError(
@@ -184,7 +185,7 @@ class BurstSchedule:
 
     def __post_init__(self) -> None:
         for name in ("period", "burst_start", "burst_length"):
-            if not isinstance(getattr(self, name), int):
+            if not is_integer(getattr(self, name)):
                 raise ValueError(f"{name} must be an integer, got {getattr(self, name)!r}")
         if self.burst_length < 1 or self.burst_start < 0:
             raise ValueError("burst_length must be >= 1 and burst_start must be >= 0")
@@ -218,9 +219,9 @@ class WorkloadConfig:
     burst: BurstSchedule | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.seed, int) or self.seed < 0:
+        if not is_integer(self.seed) or self.seed < 0:
             raise ValueError(f"seed must be an integer >= 0, got {self.seed!r}")
-        if not isinstance(self.horizon, int) or self.horizon < 0:
+        if not is_integer(self.horizon) or self.horizon < 0:
             raise ValueError(f"horizon must be an integer >= 0, got {self.horizon!r}")
         if not math.isfinite(self.arrival_rate) or self.arrival_rate < 0:
             raise ValueError(f"arrival_rate must be a finite number >= 0, got {self.arrival_rate}")
@@ -314,6 +315,8 @@ BURSTY_SCHEDULE = BurstSchedule(period=100, burst_start=80, burst_length=20, bur
 
 def quiet_rate_for_average(average_rate: float, schedule: BurstSchedule) -> float:
     """Normal (non-burst) rate that makes one full cycle average `average_rate`."""
+    if not math.isfinite(average_rate) or average_rate < 0:
+        raise ValueError(f"average_rate must be a finite number >= 0, got {average_rate}")
     quiet_ticks = schedule.period - schedule.burst_length
     if quiet_ticks == 0:
         raise ValueError("a schedule that is all burst has no quiet ticks to adjust")
@@ -339,6 +342,11 @@ def profile_config(profile: str, seed: int, horizon: int) -> WorkloadConfig:
     return WorkloadConfig(seed=seed, horizon=horizon, arrival_rate=PROFILE_ARRIVAL_RATES[profile])
 
 
+def _check_server_count(server_count: int) -> None:
+    if not is_integer(server_count) or server_count < 1:
+        raise ValueError(f"server_count must be an integer >= 1, got {server_count!r}")
+
+
 def expected_offered_load(
     config: WorkloadConfig,
     server_count: int = REFERENCE_SERVER_COUNT,
@@ -352,7 +360,10 @@ def expected_offered_load(
     is the average over the horizon; pass `rate` for the load at one rate, for
     example during a burst.
     """
+    _check_server_count(server_count)
     rate = config.mean_arrival_rate() if rate is None else rate
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(f"rate must be a finite number >= 0, got {rate}")
     mean_duration = config.duration.expected_value()
     cpu_load = (
         rate * config.cpu.expected_value() * mean_duration
@@ -373,8 +384,9 @@ def observed_offered_load(
     Total resource-time requested, divided by the capacity-time available
     over the arrival horizon.
     """
-    if horizon <= 0:
-        raise ValueError("horizon must be > 0 to measure offered load")
+    if not is_integer(horizon) or horizon < 1:
+        raise ValueError(f"horizon must be an integer >= 1 to measure offered load, got {horizon!r}")
+    _check_server_count(server_count)
     cpu_time = sum(spec.cpu_required * spec.duration for spec in specs)
     memory_time = sum(spec.memory_required * spec.duration for spec in specs)
     cpu_load = cpu_time / (horizon * server_count * REFERENCE_SERVER_CPU)

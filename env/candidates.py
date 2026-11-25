@@ -11,6 +11,7 @@ from enum import Enum
 
 from env.job import Job
 from env.server import Server
+from env.validation import is_integer
 
 CANDIDATE_LIMIT = 5
 
@@ -43,8 +44,8 @@ def select_candidates(
     broken by id. The queue itself is never modified, so a job left out of the
     window is not discarded.
     """
-    if limit < 1:
-        raise ValueError(f"candidate limit must be >= 1, got {limit}")
+    if not is_integer(limit) or limit < 1:
+        raise ValueError(f"candidate limit must be an integer >= 1, got {limit!r}")
     if rule is CandidateRule.HEAD_OF_QUEUE:
         return list(queue[:limit])
 
