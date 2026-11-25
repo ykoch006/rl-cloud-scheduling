@@ -133,6 +133,8 @@ Not yet implemented from the scope: the stress profile.
 | Drain period in comparisons | 500 ticks | ASSUMPTION | Scope §7.1 provisional value |
 | Utilisation and queue-length window in comparisons | ticks 0 to T−1 (arrival horizon); drain ticks excluded | DERIVED | Same window for every policy; ticks after an early finish count as idle |
 | Aggregation over seeds | compute each metric per seed, then take the unweighted mean of seeds | ASSUMPTION | p95 is a mean of per-seed percentiles, not a pooled percentile |
+| SLA deadline | arrival + k × duration, k = 3 | ASSUMPTION | Evaluation only; k configurable (2 and 5 planned for sensitivity); not an empirical SLA |
+| Energy | not modelled | — | Under always-on fixed servers it would repeat CPU utilisation; see EXPERIMENT_PROTOCOL.md |
 
 ## Modelling choices to review
 
@@ -140,10 +142,13 @@ Not yet implemented from the scope: the stress profile.
   redrawn, so there is no spike of jobs at exactly the maximum. The mean
   shifts slightly (table above), and the offered-load formulas use the
   truncated means.
-- **Zero demand.** `Job` accepts a demand of 0, but the generator only
-  produces strictly positive demands (minimum 1 CPU unit and 0.25 GB).
-  `Job` validation was left unchanged; whether zero should be allowed is
-  still to be decided.
+- **Zero demand.** A job may need 0 CPU or 0 RAM, but not both, since a job
+  that reserves nothing never competes for capacity. The generator still
+  only produces strictly positive demands (minimum 1 CPU unit and 0.25 GB).
+- **Whole-number time.** Arrival times, durations, horizons, seeds, burst
+  positions, server and job ids and the candidate limit must be Python or
+  NumPy integers; fractional values and booleans are rejected. Demands,
+  capacities and rates must be finite.
 - **Separate random streams.** Arrivals, CPU, RAM and durations each use a
   child generator spawned from the single seed. Changing one distribution
   does not change the values drawn for the others.
@@ -153,6 +158,7 @@ Not yet implemented from the scope: the stress profile.
   running jobs, so an empty server always reports exactly its full capacity.
   A single placement can still exceed capacity by one rounding step
   (about 1e-14), so the capacity tests allow a 1e-9 tolerance.
-- **Starvation.** The feasible-only window lets small jobs repeatedly pass a
-  large one. This has not yet been measured; the scope schedules
-  size-stratified tail checks with the Gymnasium work.
+- **Starvation.** Work-conserving policies with the feasible-only window let
+  small jobs keep taking capacity a large job is waiting for. Under heavy
+  load some large-CPU jobs waited over 500 ticks (RESULTS.md). The scope
+  schedules size-stratified tail checks with the Gymnasium work.

@@ -3,6 +3,7 @@ from collections import Counter
 from dataclasses import replace
 from statistics import fmean
 
+import numpy as np
 import pytest
 
 from env.cluster import Cluster
@@ -196,6 +197,12 @@ def test_observed_offered_load_matches_expected_offered_load():
         (dict(horizon=-1), "horizon"),
         (dict(horizon=10.5), "horizon"),
         (dict(seed=-1), "seed"),
+        (dict(seed=True), "seed"),
+        (dict(seed=1.0), "seed"),
+        (dict(horizon=True), "horizon"),
+        (dict(horizon=float("inf")), "horizon"),
+        (dict(seed=np.bool_(True)), "seed"),
+        (dict(horizon=np.float64(10.0)), "horizon"),
         (dict(cpu=replace(DEFAULT_CPU, maximum=150.0)), "CPU"),
     ],
 )
@@ -234,6 +241,9 @@ def test_invalid_log_normal_is_rejected(kwargs, message):
         (dict(mean=-5.0, maximum=100), "mean"),
         (dict(mean=10.0, maximum=0), "maximum"),
         (dict(mean=10.0, maximum=12.5), "maximum"),
+        (dict(mean=10.0, maximum=True), "maximum"),
+        (dict(mean=float("nan"), maximum=100), "mean"),
+        (dict(mean=float("inf"), maximum=100), "mean"),
         (dict(mean=10.0, maximum=2), "exclude"),
     ],
 )
@@ -326,15 +336,38 @@ def test_empty_workload_passes_validation():
     [
         ((spec(job_id=1), spec(job_id=1)), "unique"),
         ((spec(job_id=1, arrival_time=5), spec(job_id=2, arrival_time=2)), "arrival order"),
-        ((spec(cpu=0.0),), "> 0"),
+        ((spec(cpu=0.0, memory=0.0),), "both"),
+        ((spec(cpu=-1.0),), ">= 0"),
         ((spec(memory=float("nan")),), "finite"),
         ((spec(cpu=150.0),), "do not fit"),
+        ((spec(arrival_time=1.5),), "integer"),
+        ((spec(arrival_time=True),), "integer"),
+        ((spec(duration=2.5),), "integer"),
+        ((spec(duration=True),), "integer"),
+        ((spec(duration=float("nan")),), "integer"),
+        ((spec(job_id=1.5),), "id"),
+        ((spec(cpu=float("inf")),), "finite"),
+        ((spec(memory=True),), "finite"),
         ((spec(memory=80.0),), "do not fit"),
     ],
 )
 def test_invalid_workloads_are_rejected(specs, message):
     with pytest.raises(ValueError, match=message):
         validate_workload(specs, reference_servers())
+
+
+def test_one_zero_demand_and_numpy_integers_pass_validation():
+    specs = (spec(job_id=np.int64(1), arrival_time=np.int64(0), duration=np.int32(2), cpu=0.0),
+             spec(job_id=2, arrival_time=1, memory=0.0))
+
+    validate_workload(specs, reference_servers())
+
+
+def test_numpy_integer_config_gives_the_same_workload():
+    native = make_config(seed=42, horizon=100)
+    numpy_ints = make_config(seed=np.int64(42), horizon=np.int64(100))
+
+    assert generate_workload(numpy_ints) == generate_workload(native)
 
 
 def test_fit_check_uses_the_configured_servers_not_a_fixed_reference():
@@ -438,6 +471,8 @@ def test_arrivals_are_concentrated_in_burst_ticks():
         (dict(period=10, burst_start=8, burst_length=3, burst_rate=5.0), "fit inside"),
         (dict(period=0, burst_start=0, burst_length=1, burst_rate=5.0), "fit inside"),
         (dict(period=10.5, burst_start=0, burst_length=1, burst_rate=5.0), "integer"),
+        (dict(period=True, burst_start=False, burst_length=True, burst_rate=5.0), "integer"),
+        (dict(period=10, burst_start=0, burst_length=1, burst_rate=float("inf")), "burst_rate"),
         (dict(period=10, burst_start=0, burst_length=1, burst_rate=float("nan")), "burst_rate"),
         (dict(period=10, burst_start=0, burst_length=1, burst_rate=-1.0), "burst_rate"),
     ],
@@ -452,6 +487,34 @@ def test_burst_rate_must_exceed_the_normal_rate():
 
     with pytest.raises(ValueError, match="higher"):
         WorkloadConfig(seed=1, horizon=10, arrival_rate=2.0, burst=schedule)
+
+
+@pytest.mark.parametrize("rate", [float("nan"), float("inf"), -1.0])
+def test_quiet_rate_for_average_rejects_invalid_rates(rate):
+    with pytest.raises(ValueError, match="average_rate"):
+        quiet_rate_for_average(rate, BURSTY_SCHEDULE)
+
+
+@pytest.mark.parametrize("server_count", [0, -1, 2.5, True, np.bool_(True)])
+def test_offered_load_rejects_invalid_server_counts(server_count):
+    config = make_config()
+
+    with pytest.raises(ValueError, match="server_count"):
+        expected_offered_load(config, server_count=server_count)
+    with pytest.raises(ValueError, match="server_count"):
+        observed_offered_load(generate_workload(config), config.horizon, server_count)
+
+
+@pytest.mark.parametrize("rate", [float("nan"), float("inf"), -1.0])
+def test_expected_offered_load_rejects_invalid_rates(rate):
+    with pytest.raises(ValueError, match="rate"):
+        expected_offered_load(make_config(), rate=rate)
+
+
+@pytest.mark.parametrize("horizon", [0, -5, 2.5, True, float("nan")])
+def test_observed_offered_load_rejects_invalid_horizons(horizon):
+    with pytest.raises(ValueError, match="horizon"):
+        observed_offered_load(generate_workload(make_config()), horizon)
 
 
 def test_quiet_rate_for_average_rejects_impossible_schedules():

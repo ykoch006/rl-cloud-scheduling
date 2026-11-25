@@ -10,6 +10,7 @@ from env.candidates import CANDIDATE_LIMIT, CandidateRule, select_candidates
 from env.cluster import Cluster
 from env.job import Job
 from env.server import Server
+from env.validation import is_finite_number, is_integer
 
 
 class Scheduler(Protocol):
@@ -26,6 +27,54 @@ class Scheduler(Protocol):
 
     def choose(self, candidates: list[Job], servers: list[Server]) -> tuple[Job, Server] | None:
         ...
+
+
+# Slowdown factor k of the SLA deadline, arrival + k x duration. A modelling
+# assumption for evaluation only, not a measured SLA (docs/MODEL_ASSUMPTIONS.md).
+SLA_SLOWDOWN = 3
+
+
+def sla_deadline(job: Job, slowdown: float = SLA_SLOWDOWN) -> float:
+    """Latest on-time completion time for `job`: arrival + slowdown x duration."""
+    if not is_finite_number(slowdown) or slowdown < 1:
+        raise ValueError(f"SLA slowdown must be a finite number >= 1, got {slowdown!r}")
+    return job.arrival_time + slowdown * job.duration
+
+
+@dataclass(frozen=True)
+class SLAResult:
+    """SLA outcome of one run, over every job in the workload.
+
+    `violations` are confirmed: the job completed after its deadline, or it is
+    unfinished and cannot complete by its deadline any more. `unknown` jobs
+    are unfinished but could still be on time. While any job is unfinished,
+    the violation count and lateness are lower bounds.
+    """
+
+    jobs: int
+    violations: int
+    unknown: int
+    total_lateness: float
+
+    @property
+    def violation_rate(self) -> float | None:
+        """Confirmed violations / all jobs in the workload."""
+        return self.violations / self.jobs if self.jobs else None
+
+    @property
+    def unknown_rate(self) -> float | None:
+        """Unfinished jobs that could still be on time / all jobs in the workload."""
+        return self.unknown / self.jobs if self.jobs else None
+
+    @property
+    def mean_lateness(self) -> float | None:
+        """Mean lateness per job in ticks (on-time jobs count as 0)."""
+        return self.total_lateness / self.jobs if self.jobs else None
+
+
+def _check_window(ticks: int) -> None:
+    if not is_integer(ticks) or ticks < 1:
+        raise ValueError(f"measurement window must be an integer >= 1 ticks, got {ticks!r}")
 
 
 @dataclass
@@ -76,9 +125,9 @@ class SimulationMetrics:
         return len(self.unfinished_jobs)
 
     @property
-    def completion_rate(self) -> float:
-        """Fraction of all jobs in the workload that completed."""
-        return self.completed_count / self.total_jobs if self.total_jobs else 1.0
+    def completion_rate(self) -> float | None:
+        """Fraction of all jobs in the workload that completed, or None if there were none."""
+        return self.completed_count / self.total_jobs if self.total_jobs else None
 
     @property
     def censored_average_waiting_time(self) -> float | None:
@@ -91,13 +140,66 @@ class SimulationMetrics:
         average_waiting_time, it cannot look better just because the slowest
         jobs never started.
         """
-        waits = [
-            job.waiting_time if job.start_time is not None
-            else self.total_duration - job.arrival_time
-            for job in self.completed_jobs + self.unfinished_jobs
+        waits = self._censored_waits()
+        return fmean(waits) if waits else None
+
+    @property
+    def censored_p95_waiting_time(self) -> float | None:
+        """95th percentile of the censored waits (NumPy's linear interpolation).
+
+        A percentile never decreases when any value increases, so this is a
+        lower bound on the true 95th percentile wait.
+        """
+        waits = self._censored_waits()
+        return float(np.percentile(waits, 95)) if waits else None
+
+    @property
+    def censored_average_turnaround_time(self) -> float | None:
+        """Mean earliest completion - arrival over every job that arrived (a lower bound)."""
+        times = [self.earliest_completion(job) - job.arrival_time for job in self._arrived_jobs()]
+        return fmean(times) if times else None
+
+    def _arrived_jobs(self) -> list[Job]:
+        return [
+            job for job in self.completed_jobs + self.unfinished_jobs
             if job.arrival_time < self.total_duration
         ]
-        return fmean(waits) if waits else None
+
+    def _censored_waits(self) -> list[int]:
+        return [
+            job.waiting_time if job.start_time is not None
+            else self.total_duration - job.arrival_time
+            for job in self._arrived_jobs()
+        ]
+
+    def earliest_completion(self, job: Job) -> int:
+        """Completion time, or the earliest time an unfinished job can still complete.
+
+        Jobs are never preempted, so a running job completes exactly when its
+        remaining time runs out. A queued job cannot start before the run
+        ended, and a job that has not arrived cannot start before it arrives.
+        """
+        if job.completion_time is not None:
+            return job.completion_time
+        return max(self.total_duration, job.arrival_time) + job.remaining_time
+
+    def sla(self, slowdown: float = SLA_SLOWDOWN) -> SLAResult:
+        """SLA violations and lateness for deadline = arrival + slowdown x duration.
+
+        A job is on time if it completes at or before its deadline. Lateness
+        is max(0, completion - deadline), assessed once per job at completion;
+        unfinished jobs use their earliest possible completion.
+        """
+        violations = unknown = 0
+        total_lateness = 0
+        for job in self.completed_jobs + self.unfinished_jobs:
+            lateness = self.earliest_completion(job) - sla_deadline(job, slowdown)
+            if lateness > 0:
+                violations += 1
+                total_lateness += lateness
+            elif job.completion_time is None:
+                unknown += 1
+        return SLAResult(self.total_jobs, violations, unknown, total_lateness)
 
     @property
     def p95_waiting_time(self) -> float | None:
@@ -123,8 +225,7 @@ class SimulationMetrics:
         Uses the same window as average_utilisation_over. Ticks after the run
         ended had an empty queue and count as 0.
         """
-        if ticks <= 0:
-            return 0.0
+        _check_window(ticks)
         idle = [0] * max(0, ticks - len(self.queue_length))
         return fmean(self.queue_length[:ticks] + idle)
 
@@ -147,8 +248,7 @@ class SimulationMetrics:
         policy just for running longer. If the run ended before `ticks`, the
         cluster was empty for the rest of the window, so those ticks count as 0.
         """
-        if ticks <= 0:
-            return 0.0, 0.0
+        _check_window(ticks)
         idle = [0.0] * max(0, ticks - len(self.cluster_cpu_utilisation))
         cpu = self.cluster_cpu_utilisation[:ticks] + idle
         memory = self.cluster_memory_utilisation[:ticks] + idle
@@ -211,6 +311,8 @@ class Simulator:
         completed by then are recorded in metrics.unfinished_jobs rather than
         silently dropped.
         """
+        if not is_integer(max_timesteps) or max_timesteps < 0:
+            raise ValueError(f"max_timesteps must be an integer >= 0, got {max_timesteps!r}")
         while not self.is_finished() and self.current_time < max_timesteps:
             self.step()
         self.metrics.total_duration = self.current_time

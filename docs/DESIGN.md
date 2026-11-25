@@ -99,8 +99,8 @@ to fit yet and lets younger jobs use the free space. `fcfs-strict` starts
 nothing until the head of the queue fits (head-of-line blocking). Strict FCFS
 needs to see the blocked head, which the primary policies cannot, so it is
 reported separately as a reference rather than as an equal comparison.
-Backfilling improves utilisation but can starve large jobs; this has not yet
-been measured.
+Backfilling improves utilisation but can starve large jobs; under heavy load
+some large-CPU jobs waited over 500 ticks (see RESULTS.md).
 
 **Best-Fit score:** `(free CPU − job CPU) / CPU capacity + (free RAM − job
 RAM) / RAM capacity`. Dividing by capacity puts both resources on a 0–1
@@ -159,8 +159,9 @@ configuration for a named profile.
 
 `validate_workload(specs, servers)` checks any workload (generated, the fixed
 demo workload, or a trace in future) against the servers it will run on:
-unique ids, arrival order, finite positive demands and durations, and that
-every job fits on at least one server when that server is empty. A job that
+unique ids, arrival order, integer times, finite non-negative demands that
+are not both zero, and that every job fits on at least one server when that
+server is empty. A job that
 could never fit would otherwise wait forever and inflate the unfinished
 count.
 

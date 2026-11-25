@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from env.candidates import CANDIDATE_LIMIT, CandidateRule, select_candidates, servers_that_fit
@@ -69,9 +70,16 @@ def test_selection_does_not_modify_the_queue():
     assert queue == before
 
 
-def test_invalid_limit_is_rejected():
-    with pytest.raises(ValueError):
-        select_candidates([], [make_server()], limit=0)
+@pytest.mark.parametrize("limit", [0, -1, 2.5, True, float("inf"), np.bool_(True), np.int64(0)])
+def test_invalid_limit_is_rejected(limit):
+    with pytest.raises(ValueError, match="limit"):
+        select_candidates([], [make_server()], limit=limit)
+
+
+def test_numpy_integer_limit_is_accepted():
+    queue = [make_job(i) for i in range(1, 9)]
+
+    assert len(select_candidates(queue, [make_server()], limit=np.int64(3))) == 3
 
 
 def test_servers_that_fit_keeps_cluster_order():
